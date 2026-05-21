@@ -173,6 +173,120 @@ This is documented in every platform overlay as an "operating note", not as a bu
 
 ---
 
+## §10. server.ts UTF-8 corruption (Windows, non-UTF-8 ANSI codepages)
+
+### Symptom
+
+Daemon shows "**1 MCP server failed · /mcp**" in its TUI, and `/mcp` detail page reports the telegram plugin's MCP server as `× failed`. Status doesn't include an error reason. Telegram messages queue up at `getUpdates` (`ok=true, msgs>0`) and no consumer drains them. Daemon's claude.exe is alive but has **zero bun children**.
+
+Surfaces in production on:
+- 2026-05-21, Mark's Windows 11 PC (Chinese locale, GBK as ANSI codepage). Discovered after a reboot ~6 hours into the validation deploy. Diagnosis went down three wrong rabbit holes (Desktop App contention, `--scope local` plugin install, `--setting-sources` flag) before manual `bun run` invocation revealed the real error.
+
+### Root cause
+
+`server.ts` was corrupted by a tool reading the file with the **system ANSI codepage** instead of explicit UTF-8, then writing it back. On Chinese Windows the ANSI codepage is **GBK**, which mis-reads emoji bytes (e.g. `'✅'` and `'❌'` at line 937) and produces mojibake on writeback. The corruption is invisible to a casual reader of the file (it just looks weird), but **bun parses TypeScript strictly as UTF-8 and errors out** at the first malformed byte sequence.
+
+Manual bun invocation reveals the exact error:
+
+```
+error: Expected " =" but found "閴?"
+    at C:\Users\zhoub\.claude\plugins\cache\claude-plugins-official\telegram\0.0.6\server.ts:937:74
+error: Unexpected ?
+    at C:\Users\zhoub\.claude\plugins\cache\claude-plugins-official\telegram\0.0.6\server.ts:937:75
+Bun v1.3.14 (Windows x64)
+```
+
+### What corrupted the file
+
+Most likely candidate: **PowerShell 5.1's `Get-Content` without `-Encoding UTF8`** in the skill's Step 4b patch step. Windows PowerShell 5.1 defaults to the system codepage for I/O — on Chinese Windows, that's GBK. So:
+
+1. UTF-8 emoji `'✅'` (3 bytes `0xE2 0x9C 0x85`) is read as 1–2 GBK characters (mojibake)
+2. `-replace` operates on the mojibake string (doesn't touch line 937)
+3. `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))` writes the mojibake-as-UTF-8 back
+4. Result: line 937 emoji is now corrupted bytes
+
+The corruption is **silent at patch time** — the patched line (393) IS correctly modified; the unrelated line 937 is collateral damage. Bun fails to parse only when claude tries to start it for the first time after the corruption — could be hours or days later.
+
+### Permanent fix (in skill's Step 4b)
+
+Always read and write `server.ts` with **explicit UTF-8 encoding**:
+
+```powershell
+# Read
+$content = [System.IO.File]::ReadAllText($serverTs, [System.Text.UTF8Encoding]::new($false))
+# ... modify $content ...
+# Write
+[System.IO.File]::WriteAllText($serverTs, $content, [System.Text.UTF8Encoding]::new($false))
+```
+
+**Do not** use `Get-Content -Raw` without `-Encoding UTF8` in PowerShell 5.1. (PowerShell 7+ defaults to UTF-8 and is safe.) Linux/macOS shells handle UTF-8 transparently — bash/sed inherit the locale and most modern systems use `en_US.UTF-8` / similar. Only Windows + non-UTF-8 locale is affected.
+
+### Recovery (if you already hit this)
+
+The skill's Step 4b creates `server.ts.bak` **before** patching, on first run. If you have that backup, just restore it and re-patch with the correct encoding:
+
+```powershell
+$pluginDir = "$env:USERPROFILE\.claude\plugins\marketplaces\claude-plugins-official\external_plugins\telegram"
+$cacheDir = (Get-ChildItem "$env:USERPROFILE\.claude\plugins\cache\claude-plugins-official\telegram" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+
+# Restore both source and cache
+Copy-Item "$pluginDir\server.ts.bak" "$pluginDir\server.ts" -Force
+Copy-Item "$cacheDir\server.ts.bak" "$cacheDir\server.ts" -Force
+
+# Re-apply patch with explicit UTF-8
+foreach ($f in "$pluginDir\server.ts", "$cacheDir\server.ts") {
+    $content = [System.IO.File]::ReadAllText($f, [System.Text.UTF8Encoding]::new($false))
+    $patched = $content -replace "(?m)^(\s*)'claude/channel/permission':\s*\{\},", "`$1// 'claude/channel/permission': {}, // DISABLED: relays tool prompts to TG"
+    if ($patched -ne $content) {
+        [System.IO.File]::WriteAllText($f, $patched, [System.Text.UTF8Encoding]::new($false))
+    }
+}
+
+# Restart daemon — its bun will now parse cleanly
+Stop-ScheduledTask -TaskName ClaudeCodeTelegramDaemon -ErrorAction SilentlyContinue
+Get-Process bun, claude -ErrorAction SilentlyContinue | Where-Object {
+    $_.ProcessName -eq 'bun' -or (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine -like '*--channels*'
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-ScheduledTask -TaskName ClaudeCodeTelegramDaemon
+```
+
+If you **don't** have the `.bak` (e.g. you wiped the plugin cache or skipped Step 4b's patch and corrupted via a different tool), reinstall the plugin from scratch:
+
+```powershell
+& $CLAUDE_EXE plugin uninstall telegram@claude-plugins-official
+Remove-Item "$env:USERPROFILE\.claude\plugins\cache\claude-plugins-official\telegram" -Recurse -Force -ErrorAction SilentlyContinue
+& $CLAUDE_EXE plugin install telegram@claude-plugins-official
+# Now re-apply the patch using the UTF-8-safe Step 4b code
+```
+
+### Diagnostic shortcut
+
+To detect this **before** bun crashes (e.g. as part of a post-deploy verification):
+
+```powershell
+# True if file has been UTF-8-corrupted via GBK round-trip
+$bytes = [System.IO.File]::ReadAllBytes("$env:USERPROFILE\.claude\plugins\marketplaces\claude-plugins-official\external_plugins\telegram\server.ts")
+# Look for the "閴" mojibake byte sequence (E9 96 B4 in UTF-8)
+$corrupted = $false
+for ($i = 0; $i -lt $bytes.Length - 2; $i++) {
+    if ($bytes[$i] -eq 0xE9 -and $bytes[$i+1] -eq 0x96 -and $bytes[$i+2] -eq 0xB4) { $corrupted = $true; break }
+}
+if ($corrupted) { "server.ts is GBK-corrupted; restore from .bak" } else { "server.ts UTF-8 clean" }
+```
+
+### Why this wasn't caught in initial validation
+
+The first deploy on 2026-05-21 worked end-to-end because:
+- The patch was applied **once** with the buggy code, producing the corrupted file
+- The corruption was at line 937 (permission-reply emoji code path)
+- Mark's first roundtrip test ("哈喽" → reply) didn't exercise that code path
+- bun started fine on first launch (the parse error doesn't fire until bun tries to parse the file — and bun caches parsed JS, so a hot bun process keeps working until restarted)
+- A Windows reboot later (6 hours after deploy), Scheduled Task spawned a **fresh** bun, which freshly parsed server.ts, hit the corruption, and failed
+
+This is a **dormant** failure mode: it can sit undiscovered for any amount of time and surface on the next daemon restart. Recommend adding the diagnostic check above to your post-deploy health check.
+
+---
+
 ## Verifying a healthy deployment
 
 After running the skill, the following sanity checks should all pass:

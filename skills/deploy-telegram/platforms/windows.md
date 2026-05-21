@@ -210,6 +210,8 @@ if ($plugList -match 'telegram') {
 
 ## Step 4b — 🤖 Patch plugin to disable channel-permission relay
 
+> **Critical Windows lesson** (2026-05-21 incident — see [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §"server.ts UTF-8 corruption"): **always read `server.ts` with explicit UTF-8 encoding**. On Chinese-locale Windows (or any non-UTF-8 ANSI codepage), PowerShell 5.1's `Get-Content` defaults to the system codepage (e.g. GBK) and corrupts the file's emoji bytes (`'✅'`, `'❌'`). The corruption surfaces later as `Bun parse error at server.ts:937 — Expected " =" but found "閴?"`, and the daemon's `/mcp` shows "1 MCP server failed".
+
 ```powershell
 $pluginRoot = "$env:USERPROFILE\.claude\plugins\marketplaces\claude-plugins-official\external_plugins\telegram"
 $serverTs = Join-Path $pluginRoot "server.ts"
@@ -218,7 +220,9 @@ if (-not (Test-Path $serverTs)) { throw "server.ts not found at $serverTs (plugi
 $backup = "$serverTs.bak"
 if (-not (Test-Path $backup)) { Copy-Item $serverTs $backup }
 
-$content = Get-Content $serverTs -Raw
+# CRITICAL: read as UTF-8 explicitly. PowerShell 5.1 default codepage on Chinese
+# Windows is GBK, which mis-reads UTF-8 emoji bytes -> corrupts on writeback.
+$content = [System.IO.File]::ReadAllText($serverTs, [System.Text.UTF8Encoding]::new($false))
 $patched = $content -replace "(?m)^(\s*)'claude/channel/permission':\s*\{\},", "`$1// 'claude/channel/permission': {}, // DISABLED: relays tool prompts to TG despite --dangerously-skip-permissions"
 
 if ($patched -eq $content) {

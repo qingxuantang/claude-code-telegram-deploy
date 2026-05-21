@@ -67,6 +67,34 @@ For Windows: run `start-claude.ps1` manually in a visible window and watch for `
 - **No bun child**: the daemon didn't pass `--channels`. Verify `start-claude.{sh,ps1}` includes `--channels plugin:telegram@claude-plugins-official`.
 - **Bun running but on Telegram side getUpdates returns 409**: another long-poller exists somewhere. Kill all bun processes with the plugin path in their cmdline, then restart the daemon.
 
+#### Step 4a: if `/mcp` shows the MCP server as **"failed"** (bun spawn or parse failure)
+
+The Claude TUI shows `1 MCP server failed · /mcp` near the prompt indicator. Running `/mcp` inside the daemon's session shows the server detail with status `× failed` and "spawn args" but **no error reason**. To get the actual error, run bun manually with the exact same args claude was using:
+
+```powershell
+# Windows — copy the args verbatim from the /mcp detail page
+$bun = "$env:USERPROFILE\.bun\bin\bun.exe"
+$cwd = "C:/Users/zhoub/.claude/plugins/cache/claude-plugins-official/telegram/<VERSION>"
+$env:TELEGRAM_BOT_TOKEN = (Get-Content "$env:USERPROFILE\.claude\channels\telegram\.env" -Raw) -replace 'TELEGRAM_BOT_TOKEN=','' -replace '\s',''
+& $bun run --cwd $cwd --shell=bun --silent start 2>&1 | Select-Object -First 30
+```
+
+```bash
+# Linux / macOS
+cd ~/.claude/plugins/cache/claude-plugins-official/telegram/<VERSION>
+TELEGRAM_BOT_TOKEN=$(grep -oP '(?<=TELEGRAM_BOT_TOKEN=).*' ~/.claude/channels/telegram/.env) \
+  bun run --shell=bun --silent start 2>&1 | head -30
+```
+
+Common stderr patterns:
+
+| Output | Cause | Fix |
+|---|---|---|
+| `error: Expected " =" but found "閴?"` or other Unicode mojibake at `server.ts:937` | `server.ts` file got corrupted by being read/written in a non-UTF-8 codepage (e.g. GBK on Chinese Windows). Emoji `'✅'`/`'❌'` bytes got reinterpreted. | Restore `server.ts` from `server.ts.bak` (kept by the Step 4b patch step), then re-apply patch with explicit UTF-8 encoding. See [`post-deploy-hardening.md`](./post-deploy-hardening.md) §"server.ts UTF-8 corruption". |
+| `Cannot find module ...` | `bun install` never finished or `node_modules/` got deleted | `cd <plugin-cache-dir>; bun install` |
+| `TELEGRAM_BOT_TOKEN required` | `.env` not loaded — either missing, has BOM (Windows), or wrong path | See "Symptom: `.env` token not loaded" below |
+| `getMe ... 401 Unauthorized` | Bot token is invalid / revoked | Regenerate via `@BotFather /revoke` then `/token` |
+
 ### Step 5: is the Telegram bot side healthy?
 
 ```bash
