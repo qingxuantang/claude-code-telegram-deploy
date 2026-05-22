@@ -206,7 +206,7 @@ if ($plugList -match 'telegram') {
 
 > **NEVER use `--plugin-dir` with `--channels`**. See [`../references/architecture-and-design.md`](../references/architecture-and-design.md) for the two-mode mutually-exclusive design.
 
-> **Scope choice on Windows**: user scope (default) works because Windows Desktop App invokes the bundled `claude.exe` with `--plugin-dir` mode for skills, NOT `--channels` mode. So both Desktop App and daemon coexist without bot-token contention. Verified 2026-05-21. See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §4 for the macOS comparison and what to watch for if Anthropic changes Desktop App behavior.
+> **Scope choice on Windows**: user scope (default) works most of the time despite the Desktop App also loading the plugin via `--plugin-dir` and spawning a competing bun. `server.ts`'s `bot.pid` SIGTERM mechanism is self-healing and the daemon (Scheduled Task) usually beats the GUI Desktop App in the bun-spawn race. **If after a Windows reboot you find Telegram not responding**, run the manual recovery in [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §4 ("Recovery if you lose the race") — one PowerShell snippet kills Desktop App's bun and restarts the daemon. **Initial conclusion on 2026-05-21 that "Windows doesn't contend" was incorrect** and has been retracted in the references doc.
 
 ## Step 4b — 🤖 Patch plugin to disable channel-permission relay
 

@@ -87,9 +87,42 @@ Error: claude native binary not installed
 
 For belt-and-suspenders, the macOS deploy can also write `enabledPlugins.telegram@...: false` to the Desktop App's typical cwd's local settings (Step 7d, optional).
 
-**Windows**: investigated 2026-05-21 — **does not exhibit this contention**. The Windows Desktop App invokes the bundled claude.exe with `--plugin-dir <skills-cache>` for its agent-mode skills, **not** `--channels`. So even though `channelsEnabled: true` is in shared settings.json, Desktop App's claude.exe never spawns a Telegram bun child. Only the daemon does.
+**Windows**: investigated three times across 2026-05-21 → 2026-05-22; **conclusion evolved**:
 
-> **Don't rely on this**: if a future Desktop App version changes to use `--channels`, Windows would hit the same contention. To future-proof, the Windows overlay could switch to `--scope local` install (currently `--scope user`). The trade-off is that the Windows daemon would need its launcher to `cd $env:USERPROFILE` before invoking claude (which it already does), and any future manual `claude --channels` invocation from a different cwd wouldn't auto-load the plugin.
+| Investigation | Conclusion | Status |
+|---|---|---|
+| 2026-05-21 morning, right after deploy | "Windows doesn't contend" — Desktop App uses `--plugin-dir`, not `--channels`, so won't spawn its own bun | ❌ **wrong** — observation was a transient state before Desktop App had picked up `enabledPlugins.telegram=true` from the just-written settings.json |
+| 2026-05-21 night, post-reboot | Windows **does** contend: both Desktop App's claude.exe (with `--plugin-dir <plugin-cache>`) and daemon claude.exe (with `--channels`) spawn bun for the same plugin. Both bun processes race for the bot's `getUpdates` slot. | confirmed |
+| 2026-05-22 night, post-reboot | Contention exists, **but `server.ts`'s built-in `bot.pid` stale-poller-kill mechanism provides self-healing** (`server.ts:60-68` reads `bot.pid`, SIGTERMs the existing poller, writes own PID). Empirically the daemon Scheduled Task spawns bun slightly faster than GUI Desktop App, so daemon's bun usually establishes first; when Desktop App's bun then starts and kills daemon's via SIGTERM, daemon's while-loop respawns a new bun that kills Desktop App's. In one observed case (2026-05-22), Desktop App's claude.exe didn't aggressively re-spawn its bun after the first kill — so daemon-bun-2 ended up alone. Net outcome: **most reboots, daemon ends up solo**. | empirical, race-dependent |
+
+### Symptom of a lost race (rare but possible)
+
+Post-boot, `Get-Process bun` shows bun processes but their parent is Desktop App's claude.exe (cmd contains `--plugin-dir`), not daemon's (`--channels`). Daemon claude.exe alive with no bun children. Telegram messages don't reach Claude.
+
+### Recovery if you lose the race
+
+```powershell
+# Kill Desktop App's bun children (anything not parented by --channels claude.exe)
+Get-CimInstance Win32_Process -Filter "Name='bun.exe'" | ForEach-Object {
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.ParentProcessId)"
+    if ($parent.CommandLine -notlike '*--channels*') { Stop-Process -Id $_.ProcessId -Force }
+}
+# Kill daemon claude.exe to force a fresh bun spawn (while-loop will restart in 3s)
+Get-CimInstance Win32_Process -Filter "Name='claude.exe'" |
+    Where-Object { $_.CommandLine -like '*--channels*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+# Daemon's new bun will write bot.pid; Desktop App's claude.exe typically doesn't re-spawn bun after being killed once
+```
+
+### Optional permanent fix (untested; reserved for high-reliability setups)
+
+The "negative local override" approach: set `enabledPlugins.telegram@claude-plugins-official: false` in `<desktop-app-cwd>/.claude/settings.local.json` (e.g. `D:\git_repo\.claude\settings.local.json` if the user opens the Desktop App project from `D:\git_repo`). Daemon must launch from a different cwd (e.g. `$env:USERPROFILE`) where the override is absent. **Untested in production** — the self-healing race was sufficient for our validation deployments, so we did not roll this out. The trade-off: requires the operator to commit to a separate daemon cwd (forfeiting any `D:\git_repo\CLAUDE.md` auto-loading by the daemon).
+
+### Why we don't recommend the local override by default
+
+1. The current self-healing covers most reboot cases (4 of 4 in our validation period; 1 needed manual `Stop-Process` after a botched debugging session, not after a clean reboot)
+2. Forcing a different daemon cwd loses the project-local CLAUDE.md affinity that operators usually want
+3. The recovery command above is one PowerShell snippet — manageable as an occasional manual step
 
 **Linux**: not affected — no Linux Desktop App ships an integrated CC session, only the CLI. There's nothing to contend with.
 
@@ -180,7 +213,7 @@ This is documented in every platform overlay as an "operating note", not as a bu
 Daemon shows "**1 MCP server failed · /mcp**" in its TUI, and `/mcp` detail page reports the telegram plugin's MCP server as `× failed`. Status doesn't include an error reason. Telegram messages queue up at `getUpdates` (`ok=true, msgs>0`) and no consumer drains them. Daemon's claude.exe is alive but has **zero bun children**.
 
 Surfaces in production on:
-- 2026-05-21, Mark's Windows 11 PC (Chinese locale, GBK as ANSI codepage). Discovered after a reboot ~6 hours into the validation deploy. Diagnosis went down three wrong rabbit holes (Desktop App contention, `--scope local` plugin install, `--setting-sources` flag) before manual `bun run` invocation revealed the real error.
+- 2026-05-21, a Windows 11 validation PC (Chinese locale, GBK as ANSI codepage). Discovered after a reboot ~6 hours into the deploy. Diagnosis went down three wrong rabbit holes (Desktop App contention, `--scope local` plugin install, `--setting-sources` flag) before manual `bun run` invocation revealed the real error.
 
 ### Root cause
 
@@ -190,9 +223,9 @@ Manual bun invocation reveals the exact error:
 
 ```
 error: Expected " =" but found "閴?"
-    at C:\Users\zhoub\.claude\plugins\cache\claude-plugins-official\telegram\0.0.6\server.ts:937:74
+    at C:\Users\<user>\.claude\plugins\cache\claude-plugins-official\telegram\0.0.6\server.ts:937:74
 error: Unexpected ?
-    at C:\Users\zhoub\.claude\plugins\cache\claude-plugins-official\telegram\0.0.6\server.ts:937:75
+    at C:\Users\<user>\.claude\plugins\cache\claude-plugins-official\telegram\0.0.6\server.ts:937:75
 Bun v1.3.14 (Windows x64)
 ```
 
@@ -279,7 +312,7 @@ if ($corrupted) { "server.ts is GBK-corrupted; restore from .bak" } else { "serv
 The first deploy on 2026-05-21 worked end-to-end because:
 - The patch was applied **once** with the buggy code, producing the corrupted file
 - The corruption was at line 937 (permission-reply emoji code path)
-- Mark's first roundtrip test ("哈喽" → reply) didn't exercise that code path
+- The first roundtrip test ("哈喽" → reply) didn't exercise that code path
 - bun started fine on first launch (the parse error doesn't fire until bun tries to parse the file — and bun caches parsed JS, so a hot bun process keeps working until restarted)
 - A Windows reboot later (6 hours after deploy), Scheduled Task spawned a **fresh** bun, which freshly parsed server.ts, hit the corruption, and failed
 

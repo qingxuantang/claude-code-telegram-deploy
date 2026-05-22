@@ -49,7 +49,9 @@ Claude Code 2.1.x has two ways a plugin can be loaded:
 
 **Mutually exclusive**: never use both for the same plugin in the same invocation — the debug log will say `Channel notifications skipped: ... source mismatch`.
 
-This is why on Windows, the **Desktop App and the daemon coexist peacefully** without scope isolation: the Desktop App invokes the bundled `claude.exe` with `--plugin-dir` (its agent-mode skills cache), so even though `channelsEnabled: true` is in shared `settings.json`, Desktop App's process never starts a Telegram listener. Only the daemon does. (See [`post-deploy-hardening.md`](./post-deploy-hardening.md) §"Desktop App contention" for the macOS exception.)
+A nuance: when the Telegram plugin is enabled at user-scope (`enabledPlugins.telegram@claude-plugins-official: true`), **both** Desktop App and daemon spawn bun for it — Desktop App via `--plugin-dir` (skills mode, intended for tool exposure), daemon via `--channels` (channels mode, intended for long-polling). But `server.ts` itself **doesn't differentiate** between modes — it always starts the Telegram long-poll on init. So on Windows you get **two competing bun processes** racing for the bot's getUpdates slot.
+
+Salvation comes from `server.ts:60-68`'s **`bot.pid` stale-poller-kill mechanism**: each bun on startup reads `~/.claude/channels/telegram/bot.pid`, SIGTERMs whatever PID is recorded there, then writes its own PID. Whichever bun starts LATER wins. Empirically the daemon Scheduled Task fires before Desktop App finishes GUI startup, so daemon's bun usually wins (Desktop App's claude.exe doesn't aggressively re-spawn its bun after the first kill). When this race goes wrong, manual `Stop-Process` on Desktop App's bun unblocks recovery — see [`post-deploy-hardening.md`](./post-deploy-hardening.md) §4 for diagnosis + recovery + an optional permanent-fix sketch.
 
 ## The `server.ts` patch (universal)
 

@@ -74,7 +74,7 @@ The Claude TUI shows `1 MCP server failed · /mcp` near the prompt indicator. Ru
 ```powershell
 # Windows — copy the args verbatim from the /mcp detail page
 $bun = "$env:USERPROFILE\.bun\bin\bun.exe"
-$cwd = "C:/Users/zhoub/.claude/plugins/cache/claude-plugins-official/telegram/<VERSION>"
+$cwd = "$env:USERPROFILE\.claude\plugins\cache\claude-plugins-official\telegram\<VERSION>"
 $env:TELEGRAM_BOT_TOKEN = (Get-Content "$env:USERPROFILE\.claude\channels\telegram\.env" -Raw) -replace 'TELEGRAM_BOT_TOKEN=','' -replace '\s',''
 & $bun run --cwd $cwd --shell=bun --silent start 2>&1 | Select-Object -First 30
 ```

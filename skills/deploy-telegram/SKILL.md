@@ -134,7 +134,7 @@ The execution steps in each `platforms/<os>.md` reference these documents for **
 | Sed flavor | GNU sed | BSD sed | (`-replace` operator) |
 | Self-execution mode | yes (via `SSH_CMD=""`) | yes (default) | yes (default) |
 | Remote SSH mode | yes (via `SSH_CMD="ssh ..."`) | (use Linux overlay if SSH-ing to a Mac) | no |
-| Desktop App coexistence | n/a (no Desktop App on Linux) | requires `--scope local` install | works out of the box (Desktop App uses `--plugin-dir`, not `--channels`) |
+| Desktop App coexistence | n/a (no Desktop App on Linux) | requires `--scope local` install | Race condition on boot; `bot.pid` SIGTERM in `server.ts` is self-healing and daemon usually wins, but rare losses require manual `Stop-Process` on Desktop App's bun. See [`references/post-deploy-hardening.md`](./references/post-deploy-hardening.md) §4. |
 
 ## Background
 
