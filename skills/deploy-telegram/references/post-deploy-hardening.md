@@ -320,6 +320,94 @@ This is a **dormant** failure mode: it can sit undiscovered for any amount of ti
 
 ---
 
+## §11. macOS hardened-runtime `claude.exe` lacks Full Disk Access out of the box (macOS-only)
+
+### Symptom
+
+Deploy succeeds — launchd agents loaded, tmux session alive, claude listening, bun spawning correctly, scope isolation in place, bot token owned exclusively by the daemon. Telegram user sends `cat ~/Downloads/<file>` or asks Claude to analyze a file in `~/Documents/`. Claude reports `errno=1 EPERM` ("Operation not permitted") — even though `os.path.exists()` returns True and the user can read the file via the Desktop App's Bash tool.
+
+The deploy appears complete by every standard check (process tree, getUpdates, pairing, reply roundtrip), but is **functionally incomplete** for any file work on TCC-protected paths.
+
+### Root cause
+
+`claude.exe` (the npm-installed binary at `~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`) is a hardened-runtime, code-signed Mach-O. Verified via `codesign -dv`:
+
+- `flags=0x10000(runtime)` ← hardened runtime ON
+- `Identifier=com.anthropic.claude-code`
+- `TeamIdentifier=Q6L2SF6YDW` (Anthropic)
+
+macOS TCC inheritance is based on the **responsible process**, not just the parent process. For unhardened binaries (`/bin/bash`, `/bin/cat`, `tmux`, etc.), responsible-process flows through fork normally. For hardened binaries, the system **resets** the chain — subprocess TCC checks evaluate against the hardened binary, not its launchd ancestor.
+
+Even though the launchd chain (`launchd → wrapper → tmux → start-claude.sh`) inherits user-domain FDA fine, **`claude.exe` resets it**, and any Bash tool / Python / sh subprocess gets TCC-evaluated against `claude.exe`'s own grants — which are empty by default.
+
+### Misleading test (don't repeat this mistake)
+
+The first diagnosis on 2026-05-22 tested:
+
+```bash
+launchctl bsexec <wrapper-PID> /bin/cat ~/Downloads/<file>
+# exit 0, content output
+```
+
+…and (wrongly) concluded "the entire launchd-spawned tree has FDA, the EPERM claim must be a hallucination."
+
+**The test was a false positive for the wrong code path.** `/bin/cat` is unhardened, so it inherited launchd-domain FDA. The actual code path inside Claude's Bash tool is:
+
+```
+launchd → wrapper → tmux → start-claude.sh → claude.exe (HARDENED, TCC RESET) → spawn /bin/bash → cat
+```
+
+which has the TCC reset at `claude.exe` and was never tested. **Always test the exact code path of the failing process, not a convenient adjacent one** — the lesson generalizes to any sandbox / permission system (Linux capabilities, Windows MIC, etc.).
+
+This same false-positive trap is **why the FDA self-check rule installed by Step 9b lives in CLAUDE.md (executed via the Claude Bash tool), not in `start-claude.sh`**. A shell-level probe inside `start-claude.sh` would run as unhardened `/bin/bash` and report success even when `claude.exe` itself is grant-less.
+
+### Permanent fix (macos.md Step 7e)
+
+Add `claude.exe` to System Settings → Privacy & Security → Full Disk Access. One-time per Mac, GUI-only (TCC.db is SIP-protected; `tccutil` can reset but not grant). After grant:
+
+```bash
+pkill -f 'claude .*--channels plugin:telegram@claude-plugins-official'
+# start-claude.sh's while-true loop respawns claude; new process inherits the new TCC grant
+sleep 15
+# subprocesses can now read protected paths
+```
+
+### Re-application after CC updates
+
+`npm install -g @anthropic-ai/claude-code@latest` (the self-heal path in Step 7.1) replaces `claude.exe`. TCC matches by path + signing identity. Same-Anthropic-signed updates typically preserve the grant. If a future update changes signing identity (new TeamIdentifier or unsigned), the grant is lost and Step 7e must be re-run. Symptom is recurring EPERM after CC upgrade — the FDA self-check rule (Rule 3 in [`claude-md-rules.md`](./claude-md-rules.md)) installed by Step 9b catches this automatically and pings the user via Telegram on the next session start.
+
+### Diagnostic commands
+
+```bash
+# Verify claude.exe is hardened (sanity check; Anthropic 2.1.x+ always is)
+codesign -dv ~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe 2>&1 | grep -E "flags|Identifier"
+# Output should include "flags=0x10000(runtime)" and "TeamIdentifier=Q6L2SF6YDW"
+
+# Visually inspect FDA list (no programmatic way; TCC.db is SIP-protected)
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+
+# Functional test — must route through claude.exe's subprocess chain
+# (run via the Claude Bash tool inside the daemon's session, not via launchctl bsexec)
+cat ~/Downloads/.DS_Store >/dev/null 2>&1 && echo "FDA OK" || echo "FDA STILL MISSING"
+```
+
+### Discovery timeline
+
+- 2026-05-14 → 2026-05-21: macOS deploy lives in production, four hardening fixes layered on. All file work via Telegram happens to target `~/Library/`, `~/code/`, etc. — paths NOT covered by TCC defaults. No EPERM observed.
+- 2026-05-22: First Telegram request to read `~/Downloads/<file>` fails with EPERM. Two-phase investigation: Phase 1 misled by `launchctl bsexec` false positive (saw exit 0, concluded "launchd-spawned tree has FDA"). Phase 2 isolated the responsible-process reset by `codesign -dv` + manual System Settings inspection. Step 7e written and verified.
+- 8-day delay between deploy completion and discovery is what makes this failure mode dangerous — operators may declare a deploy "done" and find out months later when a user happens to request a Downloads file.
+
+### Cross-platform applicability
+
+The failure mode is **macOS-specific** (TCC is a macOS subsystem). Linux servers and Windows machines don't have an equivalent failure path because:
+
+- **Linux**: no hardened-runtime concept for npm-installed Node binaries. Subprocess permissions inherit via standard Unix uid/gid; FDA-style sandboxing isn't a thing outside container runtimes.
+- **Windows**: claude.exe is unsigned-or-MS-signed Node binary; UAC/MIC operate on a different model (per-process integrity level, not responsible-process reset). The Windows deploy hasn't exhibited an analogous EPERM mode.
+
+The general **design principle** ("self-check at the same TCC/sandbox layer the failure happens at") does carry forward — if Windows or Linux add a future restriction analogous to macOS hardened-runtime + TCC, the same CLAUDE.md-rule-via-Bash-tool pattern applies. Worth re-evaluating for each platform on major OS updates.
+
+---
+
 ## Verifying a healthy deployment
 
 After running the skill, the following sanity checks should all pass:

@@ -79,7 +79,61 @@ channel can be attached later, and any lingering picker locks it out.
 <!-- END: no-interactive-select-rule -->
 ```
 
-> **Production lesson** (2026-05-14 → 2026-05-21 hardening window, Mac mini): a single `AskUserQuestion` widget invocation locked the entire session for 1 h 15 min. MCP stdio reached its idle timeout. The reply tool's response queue silently filled and was dropped. Only `pkill claude` recovered, at the cost of losing session context. The rule promotes the behavior from "best practice" to "deterministic do-not-do".
+> **Production lesson** (2026-05-14 → 2026-05-21 hardening window, validated on a Mac mini): a single `AskUserQuestion` widget invocation locked the entire session for 1 h 15 min. MCP stdio reached its idle timeout. The reply tool's response queue silently filled and was dropped. Only `pkill claude` recovered, at the cost of losing session context. The rule promotes the behavior from "best practice" to "deterministic do-not-do".
+
+---
+
+## Rule 3: macOS FDA Self-Check on Session Start (macOS-only)
+
+**Purpose**: detect missing Full Disk Access grants on `claude.exe` early, before a user request hits the silent `errno=1 EPERM` failure mode. Discovered 2026-05-22 — Anthropic ships `claude.exe` as hardened-runtime + code-signed, which causes macOS TCC to **reset the responsible-process chain** for subprocesses. Result: even when the entire launchd → wrapper → tmux → start-claude.sh chain has user-domain FDA, claude's own Bash/Read tool subshells get evaluated against `claude.exe`'s own (empty by default) TCC grants, and any file access under `~/Downloads`, `~/Documents`, `~/Desktop`, etc. fails with EPERM.
+
+The fix is a one-time GUI grant (see [`../platforms/macos.md`](../platforms/macos.md) Step 7e + [`./post-deploy-hardening.md`](./post-deploy-hardening.md) §11). This rule provides **self-detection** so the daemon proactively warns the user via Telegram instead of failing silently mid-conversation.
+
+**Critical design constraint**: the probe must execute via Claude's Bash tool (path: `claude.exe → spawn shell → cat`), NOT from `start-claude.sh` (path: `launchd → bash → tmux → bash → cat`, all unhardened, inherits launchd-domain FDA → false-positive trap). This is why the rule lives in CLAUDE.md (read by the model on session start) rather than in the launcher script.
+
+```markdown
+
+<!-- BEGIN: macos-fda-self-check-rule -->
+## macOS FDA Self-Check on Session Start (macOS-only)
+
+On every Claude Code session start (including launchd-respawns after `pkill claude`
+or after `self_heal_native_binary` reinstalls), execute this self-check **exactly
+once** via the Bash tool, **before processing any user message**:
+
+```bash
+cat ~/Downloads/.DS_Store >/dev/null 2>&1
+echo "fda_probe_exit=$?"
+```
+
+Fallback: if `~/Downloads/.DS_Store` doesn't exist, try `~/Desktop/.DS_Store`. If
+neither exists, skip the probe (note it in `feedback.md` and proceed — most Macs
+have at least one).
+
+**If `fda_probe_exit=0`**: FDA grant is functional. Continue normally; do NOT send
+any user-facing message — silent OK.
+
+**If `fda_probe_exit=1` (EPERM)**: `claude.exe` is missing its Full Disk Access
+grant. **Immediately call `plugin:telegram:telegram - reply` to the configured
+user with this message verbatim**:
+
+> ⚠️ FDA grant missing for claude.exe. Bash/Read tools will return EPERM on
+> ~/Downloads, ~/Documents, ~/Desktop. Fix: open System Settings → Privacy &
+> Security → Full Disk Access → add
+> `/Users/<USER>/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`
+> → toggle ON → then run `pkill -f 'claude .*--channels'` so I pick up the new
+> grant on the next launchd respawn.
+
+Continue normal listening afterward — the absence of FDA doesn't break Telegram
+messaging itself; only file ops on protected paths fail. The user can still talk
+to you, and you can still do non-file work while waiting for them to fix it. Do
+NOT enter a tight retry loop checking the grant — wait for the next session start
+(post-respawn).
+<!-- END: macos-fda-self-check-rule -->
+```
+
+> **Why this rule is macOS-only**: Linux has no TCC subsystem. Windows has UAC + MIC but they don't apply the same hardened-runtime responsible-process reset to npm-installed binaries. The failure mode is unique to macOS + Anthropic's hardened distribution. Installing this rule on Linux/Windows would just add noise (the probe always succeeds there). The Linux and Windows platform overlays do **not** install this rule.
+
+> **Re-grant after CC updates**: `npm install -g @anthropic-ai/claude-code@latest` (incl. the self-heal path) replaces `claude.exe`. TCC matches by path + signing identity. As long as Anthropic ships future versions with the same TeamIdentifier (`Q6L2SF6YDW`), the grant persists. If a future update changes signing identity, the grant is lost and Step 7e must be repeated — this self-check rule catches that recurrence on the next launchd respawn.
 
 ---
 
@@ -91,7 +145,9 @@ In each platform overlay's deploy step:
 2. Append Rule 1 to `~/.claude/CLAUDE.md`
 3. Append Rule 2 to `~/CLAUDE.md`
 4. Append Rule 2 to `~/.claude/CLAUDE.md`
+5. **macOS only**: append Rule 3 to `~/CLAUDE.md`
+6. **macOS only**: append Rule 3 to `~/.claude/CLAUDE.md`
 
-Each append uses `grep -q '<!-- BEGIN: <marker> -->'` first to skip if already present. Order doesn't matter (both rules are independent); appending both even if one was already present is safe.
+Each append uses `grep -q '<!-- BEGIN: <marker> -->'` first to skip if already present. Order doesn't matter (rules are independent); appending all even if some were already present is safe.
 
 After installing the rules, **restart the daemon** so it reloads CLAUDE.md. The platform overlays handle this as part of the deploy.

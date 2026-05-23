@@ -202,6 +202,64 @@ This is the **long-session drift** failure (see [`post-deploy-hardening.md`](./p
 
 ---
 
+## Symptom (macOS): Bash / Read tool returns `Operation not permitted` (errno=1, EPERM) on `~/Downloads`/`~/Documents`/`~/Desktop`
+
+This is the **hardened-`claude.exe` TCC reset** issue, macOS-specific. See [`post-deploy-hardening.md`](./post-deploy-hardening.md) §11 for the full root-cause explanation.
+
+### Diagnose
+
+```bash
+# 1. Confirm it's EPERM, not ENOENT (different fix entirely)
+# Bash tool output:
+#   "Operation not permitted" -> EPERM (errno=1)   ← this section's issue
+#   "No such file or directory" -> ENOENT (errno=2), wrong path, not this issue
+# In Python: print(e.errno) explicitly; 1=EPERM, 2=ENOENT, 13=EACCES.
+# Note: ENOENT and EPERM can coexist — fix the path first, then re-check for EPERM.
+
+# 2. Confirm claude.exe is hardened (Anthropic 2.1.x+ always is)
+codesign -dv ~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe 2>&1 | grep -E "flags|TeamIdentifier"
+# Should include "flags=0x10000(runtime)" and "TeamIdentifier=Q6L2SF6YDW".
+
+# 3. Visually inspect the FDA list
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+# claude.exe should be listed with toggle ON.
+```
+
+### Fix
+
+Follow `../platforms/macos.md` Step 7e (FDA grant + claude restart). Summary:
+
+```bash
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+# In FDA pane: unlock -> + -> Cmd+Shift+G ->
+#   /Users/<USER>/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/
+#   select claude.exe -> Open -> ensure toggle ON
+# Then:
+pkill -f 'claude .*--channels'
+sleep 15
+```
+
+### Verify
+
+Run **through the daemon's Bash tool** (so the path goes claude.exe → spawn shell → cat — the only path that exercises the TCC reset):
+
+```bash
+cat ~/Downloads/<known-file> | head -1   # should output content, exit 0
+```
+
+> **Do NOT** verify with `launchctl bsexec ... /bin/cat ...` — that goes through unhardened `/bin/cat` and gives a false-positive "FDA OK" because the unhardened intermediate inherits launchd-domain FDA. The only valid test is via the daemon's own Bash tool (which routes through hardened `claude.exe`).
+
+### Self-detection
+
+The `macos-fda-self-check-rule` (Rule 3 in [`claude-md-rules.md`](./claude-md-rules.md), installed by macos.md Step 9b) makes the daemon **auto-detect** this state on every session start (including post-respawn after `pkill claude` or post-self-heal-reinstall). If FDA is missing, the daemon proactively `reply`s to the configured Telegram user with the exact fix steps. Make sure that rule is present in both `~/CLAUDE.md` and `~/.claude/CLAUDE.md`:
+
+```bash
+grep -l 'BEGIN: macos-fda-self-check-rule' ~/CLAUDE.md ~/.claude/CLAUDE.md
+# expected: both paths
+```
+
+---
+
 ## Last-resort: full nuke + reinstall
 
 If diagnostics aren't converging and you want to start fresh **without losing the bot/pairing**:

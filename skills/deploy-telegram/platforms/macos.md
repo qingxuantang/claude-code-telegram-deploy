@@ -4,13 +4,13 @@ macOS-native execution steps for the deploy-telegram skill. Read [`../SKILL.md`]
 
 ## Provenance
 
-Production-deployed on **Mac mini (Darwin 24.6.0 arm64)** from 2026-05-14, with four production fixes layered on by 2026-05-21. The fixes are folded into the steps below (see "Real-world lesson" callouts).
+Production-deployed on **Mac mini (Darwin 24.6.0 arm64)** from 2026-05-14, with five production fixes layered on by 2026-05-22. The fixes are folded into the steps below (see "Real-world lesson" callouts). The fifth fix (FDA grant, Step 7e) was discovered after 8 days of apparent success — the deploy looked complete but Bash/Read tools silently failed on TCC-protected paths.
 
 ## What's NOT verified
 
 - Intel Macs (only Apple Silicon tested; the self-heal logic in Step 7.1 handles both via the npm optional-dep mechanism, but the cross-arch reinstall path was not exercised)
 - macOS 13/14 specifically (tested on macOS 15 / Sequoia)
-- Multi-user macOS setups (only single-user `mz` tested)
+- Multi-user macOS setups (only single-user tested)
 
 ## 🚫 macOS-specific do-not
 
@@ -21,6 +21,7 @@ In addition to the universal do-not list in [`../SKILL.md`](../SKILL.md):
 3. **Do NOT install Telegram plugin at user scope** if Claude Desktop App is on the same Mac. Use `--scope local` (Step 5). See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §4.
 4. **Do NOT overwrite `~/.claude.json`** — Desktop App stores 23 KB of state there. Always merge (Step 3).
 5. **Do NOT run `sudo npm install -g`** — creates root-owned files in `/usr/local` that conflict with brew. Use `~/.npm-global/` prefix instead.
+6. **Do NOT assume the launchd chain inherits Full Disk Access for `claude.exe` subprocesses** — it doesn't. `claude.exe` is hardened-runtime; macOS TCC resets the responsible-process chain for subprocesses of hardened binaries. A launchd-only deploy gets `errno=1 EPERM` on `~/Downloads`, `~/Documents`, `~/Desktop`, and other TCC-protected paths — silent functional incompleteness. The skill MUST grant FDA explicitly to `claude.exe` (Step 7e) or the deploy is broken. See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §11.
 
 ## Required inputs
 
@@ -542,6 +543,56 @@ else
 fi
 ```
 
+## Step 7e — 👤 MANUAL: Grant Full Disk Access to `claude.exe`
+
+> **Critical macOS lesson** (production discovery 2026-05-22, see [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §11): without this step the deploy is **functionally incomplete**. `claude.exe` is hardened-runtime + Anthropic-signed; macOS TCC resets the responsible-process chain for subprocesses of hardened binaries, so Bash / Read tools inside the daemon's Claude session return `errno=1 EPERM` on `~/Downloads`, `~/Documents`, `~/Desktop`, and other TCC-protected paths — even though `os.path.exists()` returns True. The launchd → wrapper → tmux → start-claude.sh chain inherits user-domain FDA fine because every link is unhardened; `claude.exe` is the layer that breaks the chain.
+
+**Mandatory step that cannot be automated.** macOS TCC.db is SIP-protected; only GUI grants work and only the human user can perform them. `tccutil` can reset but not grant.
+
+### Procedure
+
+Open System Settings directly to the FDA pane:
+
+```bash
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+```
+
+In the FDA pane:
+
+1. Click the lock icon → unlock (Touch ID / password)
+2. Click the **+** button
+3. In the file picker: `Cmd+Shift+G` → paste this path (substitute your username):
+   ```
+   /Users/<USER>/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/
+   ```
+4. Select `claude.exe` → Open
+5. Confirm `claude.exe` appears in the FDA list and the toggle is **ON**
+
+### Restart so the grant takes effect
+
+The currently-running claude process holds a TCC cache from before the grant. Restart it:
+
+```bash
+pkill -f 'claude .*--channels plugin:telegram@claude-plugins-official'
+# start-claude.sh's while-true loop respawns claude in ~12 s with the new TCC grant in effect
+sleep 15
+```
+
+### Verify
+
+```bash
+# Through the daemon's Bash tool (the path that goes claude.exe -> spawn shell -> cat):
+cat ~/Downloads/.DS_Store >/dev/null 2>&1 && echo "FDA OK" || echo "FDA STILL MISSING"
+```
+
+Expected: `FDA OK`.
+
+> **Do NOT verify with `launchctl bsexec`** — that test path is unhardened `/bin/cat`, inherits launchd-domain FDA correctly, and gives a false positive. The probe MUST traverse `claude.exe`'s subprocess chain. See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §11 for the misleading-test analysis.
+
+### Re-grant after CC updates
+
+`npm install -g @anthropic-ai/claude-code@latest` (incl. the self-heal path in Step 7.1) replaces `claude.exe`. TCC matches by path + signing identity. As long as Anthropic ships future versions with the same TeamIdentifier (`Q6L2SF6YDW`), the grant persists across updates. If a future update changes signing identity, the grant is lost and Step 7e must be repeated. Symptom is the same recurring EPERM after a CC upgrade. The FDA self-check rule installed in Step 9b (Rule 3) catches this automatically on the next session start.
+
 ## Step 8 — 🤖 Bootstrap launchd agents
 
 ```bash
@@ -668,10 +719,54 @@ channel can be attached later, and any lingering picker locks it out.
 EOF
 )
 
+RULE_FDA=$(cat << 'EOF'
+
+<!-- BEGIN: macos-fda-self-check-rule -->
+## macOS FDA Self-Check on Session Start (macOS-only)
+
+On every Claude Code session start (including launchd-respawns after `pkill claude`
+or after `self_heal_native_binary` reinstalls), execute this self-check **exactly
+once** via the Bash tool, **before processing any user message**:
+
+\`\`\`bash
+cat ~/Downloads/.DS_Store >/dev/null 2>&1
+echo "fda_probe_exit=$?"
+\`\`\`
+
+Fallback: if `~/Downloads/.DS_Store` doesn't exist, try `~/Desktop/.DS_Store`. If
+neither exists, skip the probe (note it in `feedback.md` and proceed — most Macs
+have at least one).
+
+**If `fda_probe_exit=0`**: FDA grant is functional. Continue normally; do NOT send
+any user-facing message — silent OK.
+
+**If `fda_probe_exit=1` (EPERM)**: `claude.exe` is missing its Full Disk Access
+grant. **Immediately call `plugin:telegram:telegram - reply` to the configured
+user with this message verbatim**:
+
+> ⚠️ FDA grant missing for claude.exe. Bash/Read tools will return EPERM on
+> ~/Downloads, ~/Documents, ~/Desktop. Fix: open System Settings → Privacy &
+> Security → Full Disk Access → add
+> `/Users/<USER>/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`
+> → toggle ON → then run `pkill -f 'claude .*--channels'` so I pick up the new
+> grant on the next launchd respawn.
+
+Continue normal listening afterward — the absence of FDA doesn't break Telegram
+messaging itself; only file ops on protected paths fail. The user can still talk
+to you, and you can still do non-file work while waiting for them to fix it. Do
+NOT enter a tight retry loop checking the grant — wait for the next session start
+(post-respawn).
+<!-- END: macos-fda-self-check-rule -->
+EOF
+)
+
 install_block ~/CLAUDE.md '<!-- BEGIN: channel-routing-rule -->' "$RULE_CHANNEL"
 install_block ~/.claude/CLAUDE.md '<!-- BEGIN: channel-routing-rule -->' "$RULE_CHANNEL"
 install_block ~/CLAUDE.md '<!-- BEGIN: no-interactive-select-rule -->' "$RULE_NOSELECT"
 install_block ~/.claude/CLAUDE.md '<!-- BEGIN: no-interactive-select-rule -->' "$RULE_NOSELECT"
+# macOS-only Rule 3 (FDA self-check). See references/claude-md-rules.md "Install order".
+install_block ~/CLAUDE.md '<!-- BEGIN: macos-fda-self-check-rule -->' "$RULE_FDA"
+install_block ~/.claude/CLAUDE.md '<!-- BEGIN: macos-fda-self-check-rule -->' "$RULE_FDA"
 ```
 
 > See [`../references/claude-md-rules.md`](../references/claude-md-rules.md) for why both rules and both files.
@@ -727,13 +822,14 @@ Then send a test message from the phone and confirm a reply lands.
 | `~/tg-inbox-move.sh` | WatchPaths target | 700 |
 | `~/Library/LaunchAgents/com.openclaw.claude-telegram.plist` | Main supervisor plist | 644 |
 | `~/Library/LaunchAgents/com.openclaw.tg-inbox-mover.plist` | WatchPaths plist | 644 |
-| `~/CLAUDE.md` + `~/.claude/CLAUDE.md` | Both rule blocks installed | 644 |
+| `~/CLAUDE.md` + `~/.claude/CLAUDE.md` | Three rule blocks installed (channel routing + no-interactive-select + macOS-FDA-self-check) | 644 |
 | `~/Library/Logs/claude-telegram.log` | launchd stderr/stdout | 644 |
 | `~/telegram-inbox/` | Safe destination for uploads | 755 |
+| **System Settings FDA grant for `claude.exe`** | One-time GUI grant (Step 7e) to give claude subprocesses TCC access to protected paths | n/a (GUI, SIP-protected TCC.db) |
 
 ## Compatibility
 
 - **macOS version**: 12 (Monterey) or later (`launchctl bootstrap` syntax)
 - **Architecture**: Apple Silicon (arm64) and Intel (x86_64) both supported
 - **Claude Desktop App coexistence**: supported via Step 5 (local-scope) + Step 7d (defense-in-depth)
-- **Tested**: production on Mac mini (Darwin 24.6.0 arm64), 2026-05-14 → 2026-05-21
+- **Tested**: production on Mac mini (Darwin 24.6.0 arm64), 2026-05-14 → 2026-05-22 (FDA fix discovered 2026-05-22 after 8 days of apparent success)
