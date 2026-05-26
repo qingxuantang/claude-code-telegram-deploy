@@ -196,7 +196,9 @@ EOF
 
 > `channelsEnabled: true` is mandatory; `permissions.defaultMode: "bypassPermissions"` is the only setting that actually silences permission prompts. See [`../references/architecture-and-design.md`](../references/architecture-and-design.md).
 
-## Step 5 — 🤖 Install Telegram plugin
+## Step 5 — 🤖 Install Telegram plugin (+ explicit local-scope enable for CC 2.1.149+)
+
+> **Critical 2.1.149+ behavior change** (discovered on Windows 2026-05-26, applies to all platforms): Claude Code 2.1.149 stopped honoring `enabledPlugins.<name>: true` in user-scope `~/.claude/settings.json` when deciding whether to auto-load a plugin for `--channels`. The flag is now only read from **local-scope** `<cwd>/.claude/settings.local.json`. Symptom: daemon starts, `claude plugin list` shows `× disabled` despite settings.json having `true`, claude never spawns bun, Telegram silently goes dark. The explicit `plugin enable` line below writes local-scope settings at `$HOME/.claude/settings.local.json` (since the daemon's start-claude.sh runs `cd ~` before invoking claude). See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §12.
 
 ```bash
 $SSH_CMD bash -s << ENDPLUGIN
@@ -204,20 +206,35 @@ set -e
 export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_TOKEN}'
 export PATH="\$HOME/.bun/bin:\$PATH"
 
+# The plugin enable below writes <cwd>/.claude/settings.local.json. The daemon's
+# start-claude.sh runs `cd ~` first, so we enable from \$HOME here to match.
+cd "\$HOME"
+mkdir -p "\$HOME/.claude"
+
 claude plugin marketplace add anthropics/claude-plugins-official 2>&1 || true
 claude plugin marketplace update claude-plugins-official 2>&1 | tail -1
 
 claude plugin uninstall telegram@claude-plugins-official 2>/dev/null || true
 claude plugin install telegram@claude-plugins-official 2>&1 | tail -1
 
-claude plugin list 2>&1 | grep -q telegram || { echo "FATAL: Plugin install failed."; exit 1; }
-echo "OK: telegram plugin installed"
+# CRITICAL: explicit enable. 2.1.149+ ignores user-scope enabledPlugins for --channels.
+# This writes \$HOME/.claude/settings.local.json which the daemon (cd ~) reads.
+claude plugin enable telegram@claude-plugins-official 2>&1 | tail -2
+
+# Verify
+claude plugin list 2>&1 | grep -q 'telegram.*enabled' \\
+  || { echo "FATAL: Plugin not enabled. Output:"; claude plugin list 2>&1; exit 1; }
+test -f "\$HOME/.claude/settings.local.json" \\
+  || { echo "FATAL: settings.local.json missing — 'plugin enable' did not write to expected location"; exit 1; }
+echo "OK: telegram plugin installed AND enabled (local scope at \$HOME)"
 ENDPLUGIN
 ```
 
 > **NEVER use `--plugin-dir` with `--channels`** — see [`../references/architecture-and-design.md`](../references/architecture-and-design.md) §"The two channelsEnabled modes".
 >
-> **Linux scope**: user scope (default, no `--scope local`) is fine because Linux servers typically don't run a desktop Claude.app. macOS uses `--scope local` to avoid Desktop App contention — see [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §4.
+> **If you change `start-claude.sh`'s `cd ~` to a different cwd**, re-run this step from that cwd — `settings.local.json` is per-directory.
+>
+> **Linux scope on older CC** (pre-2.1.149): user scope worked. Linux servers typically don't run a desktop Claude.app so contention wasn't an issue. With 2.1.149+'s explicit local-scope requirement, this is now an aligned, hardened deploy regardless of CC version.
 
 ## Step 5b — 🤖 Patch plugin server.ts (GNU sed)
 

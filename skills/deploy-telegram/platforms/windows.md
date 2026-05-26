@@ -180,7 +180,16 @@ $json = $settings | ConvertTo-Json -Depth 10
 
 ## Step 4 — 🤖 Install Telegram plugin
 
+> **Critical 2.1.149+ behavior change** (discovered 2026-05-26): Claude Code 2.1.149 stopped respecting `enabledPlugins.<name>: true` in user-scope `~/.claude/settings.json` when deciding whether to auto-load a plugin for `--channels` mode. The flag is now only read from **local-scope** `<cwd>/.claude/settings.local.json`. Symptom: daemon starts, `claude plugin list` shows `× disabled` despite settings.json having `true`, so claude.exe never spawns bun. See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §12. The fix below **explicitly enables in local scope at the daemon's cwd** to be 2.1.149-compatible.
+
 ```powershell
+# Choose the daemon's cwd (where start-claude.ps1 will Set-Location to in Step 6).
+# Plugin enable will write to <DAEMON_CWD>\.claude\settings.local.json; the daemon
+# at the same cwd then reads it. Make sure these match.
+$DAEMON_CWD = $env:USERPROFILE     # or your preferred path (e.g. 'D:\projects')
+New-Item -ItemType Directory -Force -Path "$DAEMON_CWD\.claude" | Out-Null
+Set-Location $DAEMON_CWD
+
 # Plugin marketplace is global; idempotent.
 & $env:CLAUDE_EXE plugin marketplace add anthropics/claude-plugins-official 2>&1 | Out-Null
 & $env:CLAUDE_EXE plugin marketplace update claude-plugins-official 2>&1 | Select-Object -Last 1
@@ -195,18 +204,33 @@ $ErrorActionPreference = $prevPref
 
 & $env:CLAUDE_EXE plugin install telegram@claude-plugins-official 2>&1 | Select-Object -Last 3
 
+# CRITICAL: explicit enable at LOCAL scope (writes <DAEMON_CWD>\.claude\settings.local.json).
+# Without this, 2.1.149+ shows the plugin as "× disabled" even with user-scope settings.json
+# having enabledPlugins.telegram=true, and claude --channels won't spawn bun.
+& $env:CLAUDE_EXE plugin enable telegram@claude-plugins-official 2>&1 | Select-Object -Last 2
+
 # Verify
 $plugList = & $env:CLAUDE_EXE plugin list 2>&1
-if ($plugList -match 'telegram') {
-    "OK: telegram plugin installed"
+if ($plugList -match 'telegram' -and $plugList -match 'enabled') {
+    "OK: telegram plugin installed AND enabled"
 } else {
-    throw "Plugin install failed. Output: $plugList"
+    throw "Plugin install/enable failed. Output: $plugList"
 }
+
+# Sanity-check the local-scope file got written
+if (-not (Test-Path "$DAEMON_CWD\.claude\settings.local.json")) {
+    throw "settings.local.json missing at $DAEMON_CWD\.claude\ — plugin enable may have written elsewhere; check 'claude plugin list' output above for 'scope:' line"
+}
+"OK: local-scope enabledPlugins written to $DAEMON_CWD\.claude\settings.local.json"
 ```
 
 > **NEVER use `--plugin-dir` with `--channels`**. See [`../references/architecture-and-design.md`](../references/architecture-and-design.md) for the two-mode mutually-exclusive design.
 
-> **Scope choice on Windows**: user scope (default) works most of the time despite the Desktop App also loading the plugin via `--plugin-dir` and spawning a competing bun. `server.ts`'s `bot.pid` SIGTERM mechanism is self-healing and the daemon (Scheduled Task) usually beats the GUI Desktop App in the bun-spawn race. **If after a Windows reboot you find Telegram not responding**, run the manual recovery in [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §4 ("Recovery if you lose the race") — one PowerShell snippet kills Desktop App's bun and restarts the daemon. **Initial conclusion on 2026-05-21 that "Windows doesn't contend" was incorrect** and has been retracted in the references doc.
+> **Why local scope** (not just user scope): see the 2.1.149+ note above. As a side benefit, this also makes the "Desktop App contention" failure mode less likely: Desktop App's claude.exe usually runs from a different cwd (whichever project the operator opens in Claude Code's UI) and won't pick up this local-scope enable.
+
+> **If you later change `start-claude.ps1`'s `Set-Location`** to a different directory, **re-run this Step 4** in that new directory — `settings.local.json` is per-cwd. A common mistake: install at `$env:USERPROFILE`, then point start-claude.ps1 at `D:\projects`, then wonder why daemon shows plugin disabled.
+
+> **Scope choice on Windows**: user scope (default for older CC) used to work most of the time despite the Desktop App also loading the plugin via `--plugin-dir` and spawning a competing bun. `server.ts`'s `bot.pid` SIGTERM mechanism is self-healing and the daemon (Scheduled Task) usually beats the GUI Desktop App in the bun-spawn race. **If after a Windows reboot you find Telegram not responding**, run the manual recovery in [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §4 ("Recovery if you lose the race") — one PowerShell snippet kills Desktop App's bun and restarts the daemon. **Initial conclusion on 2026-05-21 that "Windows doesn't contend" was incorrect** and has been retracted in the references doc. As of 2.1.149+, local-scope install (above) also helps avoid contention since Desktop App at a different cwd won't auto-load the plugin.
 
 ## Step 4b — 🤖 Patch plugin to disable channel-permission relay
 
@@ -259,19 +283,34 @@ Set-Acl "$telegramDir\.env" $acl
 
 ## Step 6 — 🤖 Create start-claude.ps1 (the daemon launcher)
 
+> **Critical lesson** (2026-05-26): hardcoding the Claude Code version path (e.g. `claude-code\2.1.142\claude.exe`) breaks on the next Desktop App auto-update, which installs a new version directory beside the old one. The daemon may still find the old binary on disk (Anthropic keeps prior versions), but the old binary's plugin loader can be incompatible with the new shared state — symptom is the daemon launching but never spawning bun (silent failure). **Always pick the newest version dynamically at script-run time**, not deploy time. The launcher below does this.
+
+> **The launcher's `Set-Location` must match the cwd you used in Step 4** when running `claude plugin enable`. `settings.local.json` is per-cwd; if they mismatch, daemon shows plugin disabled.
+
 ```powershell
 $startScript = "$env:USERPROFILE\start-claude.ps1"
 $bunDir = Split-Path $env:BUN_EXE
+# Echo the daemon cwd you used in Step 4 here. Default: $env:USERPROFILE.
+$DAEMON_CWD_LITERAL = $env:USERPROFILE   # change if you used a different cwd in Step 4
 
 $startContent = @"
 # Auto-generated by deploy-telegram skill. Do not commit (contains tokens).
 `$env:PATH = '$bunDir;' + `$env:PATH
 
-Set-Location `$env:USERPROFILE
+Set-Location '$DAEMON_CWD_LITERAL'
+
+# Dynamically pick the NEWEST bundled claude.exe — Desktop App auto-updates
+# replace the version directory under %APPDATA%\Claude\claude-code\, so any
+# hardcoded version path breaks after each upgrade (silent failure on next
+# daemon restart). Always resolve at script-run time.
+`$claudeRoot = "`$env:APPDATA\Claude\claude-code"
+`$claudeExe = (Get-ChildItem `$claudeRoot -Directory -ErrorAction SilentlyContinue |
+               Sort-Object @{Expression={[version]`$_.Name}} -Descending |
+               Select-Object -First 1).FullName + "\claude.exe"
+
 while (`$true) {
     try {
-        & '$env:CLAUDE_EXE' --dangerously-skip-permissions ``
-            --channels plugin:telegram@claude-plugins-official
+        & `$claudeExe --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official
     } catch {
         Write-Host "claude.exe threw: `$_"
     }

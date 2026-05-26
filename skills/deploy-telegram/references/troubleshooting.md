@@ -67,6 +67,36 @@ For Windows: run `start-claude.ps1` manually in a visible window and watch for `
 - **No bun child**: the daemon didn't pass `--channels`. Verify `start-claude.{sh,ps1}` includes `--channels plugin:telegram@claude-plugins-official`.
 - **Bun running but on Telegram side getUpdates returns 409**: another long-poller exists somewhere. Kill all bun processes with the plugin path in their cmdline, then restart the daemon.
 
+#### Step 4 (sub-check before 4a): is the plugin actually **enabled**?
+
+Check `claude plugin list`. If it shows `× disabled` despite `~/.claude/settings.json` having `enabledPlugins.telegram@claude-plugins-official: true`, you're hitting the **CC 2.1.149+ plugin loader change** — user-scope `enabledPlugins` is no longer respected; only local-scope `<cwd>/.claude/settings.local.json` is. See [`post-deploy-hardening.md`](./post-deploy-hardening.md) §12.
+
+Symptoms when this is the cause:
+- `claude --channels` daemon process alive, but **zero bun children** (despite `--channels` flag being correct)
+- `claude plugin list` → `× disabled`
+- Manual `bun run --cwd <plugin-cache> --shell=bun --silent start` works fine
+- No 409 conflict, no parse errors, daemon silently does nothing
+
+Fix:
+
+```bash
+# Linux / macOS — cd to the daemon's launch cwd FIRST
+cd <DAEMON_CWD>      # usually $HOME, but match start-claude.sh's `cd`
+claude plugin enable telegram@claude-plugins-official
+claude plugin list   # should now show "enabled"
+ls -la <DAEMON_CWD>/.claude/settings.local.json   # should exist with enabledPlugins
+```
+
+```powershell
+# Windows — cd to the daemon's launch cwd FIRST (match start-claude.ps1's Set-Location)
+Set-Location <DAEMON_CWD>
+& $env:CLAUDE_EXE plugin enable telegram@claude-plugins-official
+& $env:CLAUDE_EXE plugin list   # should now show "enabled"
+Get-Content "<DAEMON_CWD>\.claude\settings.local.json" -Raw
+```
+
+Then restart the daemon so it picks up the new local-scope enable. If `plugin list` still shows disabled after enable, double-check you ran `plugin enable` in the **exact same cwd** as start-claude's `cd` / `Set-Location`.
+
 #### Step 4a: if `/mcp` shows the MCP server as **"failed"** (bun spawn or parse failure)
 
 The Claude TUI shows `1 MCP server failed · /mcp` near the prompt indicator. Running `/mcp` inside the daemon's session shows the server detail with status `× failed` and "spawn args" but **no error reason**. To get the actual error, run bun manually with the exact same args claude was using:

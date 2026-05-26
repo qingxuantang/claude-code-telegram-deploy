@@ -116,7 +116,7 @@ Get-CimInstance Win32_Process -Filter "Name='claude.exe'" |
 
 ### Optional permanent fix (untested; reserved for high-reliability setups)
 
-The "negative local override" approach: set `enabledPlugins.telegram@claude-plugins-official: false` in `<desktop-app-cwd>/.claude/settings.local.json` (e.g. `D:\git_repo\.claude\settings.local.json` if the user opens the Desktop App project from `D:\git_repo`). Daemon must launch from a different cwd (e.g. `$env:USERPROFILE`) where the override is absent. **Untested in production** — the self-healing race was sufficient for our validation deployments, so we did not roll this out. The trade-off: requires the operator to commit to a separate daemon cwd (forfeiting any `D:\git_repo\CLAUDE.md` auto-loading by the daemon).
+The "negative local override" approach: set `enabledPlugins.telegram@claude-plugins-official: false` in `<desktop-app-cwd>/.claude/settings.local.json` (e.g. `D:\projects\.claude\settings.local.json` if the user opens the Desktop App project from `D:\projects`). Daemon must launch from a different cwd (e.g. `$env:USERPROFILE`) where the override is absent. **Untested in production** — the self-healing race was sufficient for our validation deployments, so we did not roll this out. The trade-off: requires the operator to commit to a separate daemon cwd (forfeiting any `D:\projects\CLAUDE.md` auto-loading by the daemon).
 
 ### Why we don't recommend the local override by default
 
@@ -405,6 +405,86 @@ The failure mode is **macOS-specific** (TCC is a macOS subsystem). Linux servers
 - **Windows**: claude.exe is unsigned-or-MS-signed Node binary; UAC/MIC operate on a different model (per-process integrity level, not responsible-process reset). The Windows deploy hasn't exhibited an analogous EPERM mode.
 
 The general **design principle** ("self-check at the same TCC/sandbox layer the failure happens at") does carry forward — if Windows or Linux add a future restriction analogous to macOS hardened-runtime + TCC, the same CLAUDE.md-rule-via-Bash-tool pattern applies. Worth re-evaluating for each platform on major OS updates.
+
+---
+
+## §12. Claude Code 2.1.149+ ignores user-scope `enabledPlugins` for `--channels` auto-load (universal)
+
+### Symptom
+
+Deploy completes; `claude plugin install telegram@claude-plugins-official` succeeds; `~/.claude/settings.json` contains `enabledPlugins.telegram@claude-plugins-official: true`. But:
+
+- `claude plugin list` shows the plugin as `× disabled`
+- Daemon's `claude --channels plugin:telegram@claude-plugins-official` starts, stays alive, but **does not spawn bun**
+- No 409, no error, daemon TUI may show "Listening for channel messages" but functionally nothing flows
+- Manual `bun run --cwd <plugin-cache-dir> ...` works perfectly (so it's not a server.ts / token / network issue)
+
+Empirically observed on Windows after the Desktop App auto-updated from 1.8089 → 1.8555 (which bumped bundled `claude-code` from 2.1.142 → 2.1.149) on 2026-05-26. After a reboot, the previously-working daemon went silent. Diagnosis took ~30 min and went through several wrong leads (battery policy on Scheduled Task, hardcoded version path, dynamic version pick) before `claude plugin list` showing `× disabled` revealed the real cause.
+
+### Root cause
+
+Claude Code 2.1.149 changed the plugin-loading semantics:
+
+- **Pre-2.1.149**: `enabledPlugins.<name>: true` in **any** of the merged-in settings files (user, project, local) was enough to enable the plugin
+- **2.1.149+**: only **local-scope** `<cwd>/.claude/settings.local.json` is consulted for `enabledPlugins`. User-scope `~/.claude/settings.json` is **silently ignored** for this specific field
+
+So a deploy that ran `claude plugin install` without `--scope local` (which writes user-scope) leaves the plugin "registered" but "disabled" from 2.1.149's loader's perspective. `claude --channels` sees the plugin name on the command line but, finding no local-scope enable, skips spawning its MCP server (bun).
+
+Not announced as a breaking change in CC release notes (as of writing) — discovered empirically.
+
+### Fix
+
+After `claude plugin install`, **explicitly** run `claude plugin enable telegram@claude-plugins-official` from the cwd the daemon will use. This writes the local-scope `settings.local.json`:
+
+```bash
+# Linux / macOS — from the daemon's launch cwd (typically $HOME)
+cd ~
+claude plugin install telegram@claude-plugins-official   # or --scope local on Mac
+claude plugin enable telegram@claude-plugins-official    # writes ~/.claude/settings.local.json
+```
+
+```powershell
+# Windows — from the daemon's launch cwd (typically $env:USERPROFILE)
+Set-Location $env:USERPROFILE
+& $claudeExe plugin install telegram@claude-plugins-official
+& $claudeExe plugin enable telegram@claude-plugins-official   # writes ...\.claude\settings.local.json
+```
+
+Verify with `claude plugin list` — should now show `√ enabled`. Verify by inspecting `<cwd>/.claude/settings.local.json` exists and contains `"enabledPlugins": { "telegram@claude-plugins-official": true }`.
+
+### cwd-coupling caveat
+
+`settings.local.json` is **per-cwd**. If the daemon's launcher script (`start-claude.sh` / `start-claude.ps1`) later changes its `cd` / `Set-Location` to a different directory, the enable doesn't follow — daemon will show plugin disabled again. **Re-run `claude plugin enable` from any new daemon cwd**, or design the deploy to lock the daemon cwd at install time.
+
+Failure pattern: operator deploys at `$HOME`, plugin enabled, daemon works. Later edits `start-claude.sh` to `cd /opt/projects` for project-context reasons. Next daemon restart: plugin shows disabled because `/opt/projects/.claude/settings.local.json` doesn't exist. Wastes time re-diagnosing.
+
+### Side benefit: less Desktop App contention
+
+Local-scope install also reduces the Desktop App contention discussed in §4 (macOS) / its Windows variant. Since the Desktop App's claude.exe usually runs from a different cwd than the daemon's, it won't auto-load a plugin enabled only at the daemon's cwd's local scope. **Net upgrade: 2.1.149's restriction effectively forces the same isolation pattern Mac always recommended.**
+
+### Re-application after CC updates
+
+`npm install -g @anthropic-ai/claude-code@latest` / Desktop App auto-update / cache wipe → may not touch `settings.local.json`, so the enable typically survives. But if a future CC version changes the local-scope file location or schema, the enable could be lost silently. The CLAUDE.md no-self-check rule for "is plugin enabled" doesn't exist today; add it as a CLAUDE.md rule (similar to macOS FDA self-check Rule 3) if this becomes a recurring problem.
+
+### Diagnostic check
+
+```bash
+# Linux / macOS
+claude plugin list | grep telegram   # must show "enabled", not "disabled"
+test -f <daemon-cwd>/.claude/settings.local.json && \
+  jq -r '.enabledPlugins."telegram@claude-plugins-official"' <daemon-cwd>/.claude/settings.local.json
+# Expected output: true
+```
+
+```powershell
+# Windows
+& $claudeExe plugin list | Select-String 'telegram.*enabled'
+(Get-Content "$DAEMON_CWD\.claude\settings.local.json" -Raw | ConvertFrom-Json).enabledPlugins
+```
+
+### Why we discovered this only on Windows
+
+Reboot exposed the problem because the daemon process needs to re-load settings on each launch. On Linux production servers (rarely rebooted), the old daemon process kept running with cached plugin state from the pre-2.1.149 install, masking the bug. On Mac, the skill already uses `--scope local` install which (depending on 2.1.149's exact semantics) may write local-scope enable as a side effect. Windows, with frequent reboots and user-scope install, was the most exposed.
 
 ---
 

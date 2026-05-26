@@ -183,9 +183,18 @@ claude plugin marketplace update claude-plugins-official 2>&1 | tail -2
 claude plugin uninstall telegram@claude-plugins-official 2>&1 | tail -2 || true
 claude plugin install telegram@claude-plugins-official --scope local 2>&1 | tail -3
 
-claude plugin list 2>&1 | grep -q telegram \
-  || { echo "FATAL: plugin install failed"; exit 1; }
-echo "OK: telegram plugin installed at LOCAL scope (cwd=$HOME)"
+# CC 2.1.149+ defense-in-depth: explicit enable to ensure local-scope
+# settings.local.json carries enabledPlugins.telegram=true. `install --scope local`
+# should also enable, but 2.1.149's plugin loader bug observed on Windows 2026-05-26
+# makes the explicit step worth keeping as a safety net.
+# See ../references/post-deploy-hardening.md §12.
+claude plugin enable telegram@claude-plugins-official 2>&1 | tail -2
+
+claude plugin list 2>&1 | grep -q 'telegram.*enabled' \
+  || { echo "FATAL: plugin install/enable failed. Output:"; claude plugin list 2>&1; exit 1; }
+test -f "$HOME/.claude/settings.local.json" \
+  || { echo "FATAL: settings.local.json missing at \$HOME/.claude/"; exit 1; }
+echo "OK: telegram plugin installed AND enabled at LOCAL scope (cwd=$HOME)"
 ```
 
 > **DO NOT use `--plugin-dir` with `--channels`** — see [`../references/architecture-and-design.md`](../references/architecture-and-design.md).
