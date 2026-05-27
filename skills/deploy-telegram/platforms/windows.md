@@ -662,6 +662,118 @@ Install-Block "$env:USERPROFILE\.claude\CLAUDE.md" $ruleNoSelect "<!-- BEGIN: no
 > Start-ScheduledTask -TaskName ClaudeCodeTelegramDaemon
 > ```
 
+## Step 11 — 🤖 Post-boot self-heal (defensive Scheduled Task + manual recovery script)
+
+> **Why this exists** (production discovery 2026-05-27, multiple times before that): Windows bot-token race on boot (see [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §4). Daemon usually wins via `server.ts`'s `bot.pid` SIGTERM mechanism, but the race is non-deterministic. When daemon loses, manual `Stop-Process` recovery is needed. This step automates that recovery as a one-shot Scheduled Task that fires 90 s after each user logon, plus drops a Desktop shortcut for manual re-runs.
+
+> **Why "kill daemon + respawn" is harmless even when daemon was healthy**: just-launched daemon has no session context to lose; just-launched Desktop App is unlikely to be using `mcp__plugin_telegram_telegram__*` tools yet; Telegram queues messages server-side for 24 h so the ~15-s respawn gap loses nothing. Idempotent by design.
+
+### 11a. Write the self-heal script
+
+```powershell
+$fix = "$env:USERPROFILE\fix-daemon.ps1"
+$fixContent = @'
+# fix-daemon.ps1 — idempotent self-heal for the Telegram daemon.
+# Kills any bun whose root parent isn't claude --channels (i.e. Desktop App's
+# bun, which contends for the bot.pid slot), then kills the daemon claude
+# itself so start-claude.ps1's while-loop respawns it with a fresh bun.
+# Safe to re-run; ~15-s downtime per run; no message loss (Telegram queues).
+
+$ErrorActionPreference = 'Continue'
+$log = "$env:USERPROFILE\fix-daemon.log"
+function Log($msg) {
+    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg" | Out-File $log -Append -Encoding utf8
+}
+
+Log "=== fix-daemon start ==="
+
+$contendingBuns = @()
+Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+    $bunPid = $_.ProcessId
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.ParentProcessId)" -ErrorAction SilentlyContinue
+    if ($parent -and $parent.Name -eq 'bun.exe') {
+        $grandparent = Get-CimInstance Win32_Process -Filter "ProcessId=$($parent.ParentProcessId)" -ErrorAction SilentlyContinue
+        $rootCmd = if ($grandparent) { $grandparent.CommandLine } else { '' }
+    } else {
+        $rootCmd = if ($parent) { $parent.CommandLine } else { '' }
+    }
+    if ($rootCmd -notlike '*--channels*') {
+        $contendingBuns += $bunPid
+        Log "contending bun PID=$bunPid"
+    }
+}
+
+foreach ($p in $contendingBuns) {
+    try { Stop-Process -Id $p -Force -ErrorAction Stop; Log "  killed contending bun $p" }
+    catch { Log ("  failed to kill {0}: {1}" -f $p, $_.Exception.Message) }
+}
+if ($contendingBuns.Count -eq 0) { Log "no contending bun found (daemon may already be solo)" }
+
+$daemonClaudes = Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*--channels*' }
+foreach ($c in $daemonClaudes) {
+    try { Stop-Process -Id $c.ProcessId -Force -ErrorAction Stop; Log "killed daemon claude $($c.ProcessId)" }
+    catch { Log "failed: $($_.Exception.Message)" }
+}
+
+Start-Sleep -Seconds 20
+
+$bunCount = (Get-Process bun -ErrorAction SilentlyContinue).Count
+$daemonCount = @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*--channels*' }).Count
+Log "after-state: daemon=$daemonCount, bun=$bunCount (expect 1, 2)"
+
+try {
+    $token = ((Get-Content "$env:USERPROFILE\.claude\channels\telegram\.env" -Raw) -replace 'TELEGRAM_BOT_TOKEN=','' -replace '\s','')
+    $r = Invoke-RestMethod "https://api.telegram.org/bot$token/getUpdates?limit=1&timeout=0" -TimeoutSec 8
+    Log "telegram getUpdates: ok=$($r.ok), msgs-queued=$($r.result.Count)"
+} catch { Log "telegram check failed: $($_.Exception.Message)" }
+
+Log "=== fix-daemon done ==="
+'@
+[System.IO.File]::WriteAllText($fix, $fixContent, [System.Text.UTF8Encoding]::new($false))
+"OK: $fix"
+```
+
+### 11b. Register the heal Scheduled Task (AtLogOn + 90 s delay, one-shot)
+
+```powershell
+$taskName = "ClaudeCodeTelegramDaemonHeal"
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$env:USERPROFILE\fix-daemon.ps1`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+$trigger.Delay = 'PT90S'   # 90 s after logon — lets daemon + Desktop App both settle first
+$settingsTask = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
+
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settingsTask -Principal $principal -Force | Out-Null
+"OK: $taskName registered (AtLogOn + 90 s delay)"
+```
+
+### 11c. Desktop shortcut for manual recovery (one-click "click when phone goes silent")
+
+```powershell
+$shortcut = "$env:USERPROFILE\Desktop\Fix Claude Telegram Daemon.cmd"
+$cmdContent = "@echo off`r`nREM Click this when Telegram from phone doesn't reach Claude.`r`nREM Runs ~/fix-daemon.ps1 (idempotent — safe even if daemon is already healthy).`r`nREM Log: %USERPROFILE%\fix-daemon.log`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%USERPROFILE%\fix-daemon.ps1`"`r`necho.`r`necho Done. Check %USERPROFILE%\fix-daemon.log for details.`r`necho.`r`npause`r`n"
+[System.IO.File]::WriteAllText($shortcut, $cmdContent, [System.Text.UTF8Encoding]::new($false))
+"OK: $shortcut (double-click to fix daemon manually)"
+```
+
+### Test the heal flow once
+
+```powershell
+Start-ScheduledTask -TaskName ClaudeCodeTelegramDaemonHeal
+Start-Sleep 30
+Get-Content "$env:USERPROFILE\fix-daemon.log" -Tail 10
+# Should show: start -> killed daemon claude -> after-state daemon=1, bun=2 -> telegram ok=True -> done
+```
+
+> **What if the operator is mid-Telegram-conversation when this fires?** Edge case worth knowing. The 90 s delay positions this AFTER boot but BEFORE most realistic Telegram usage starts. If somehow a multi-turn Telegram conversation is in flight at exactly that moment, the daemon session restart would wipe context — next Telegram message starts fresh. Acceptable trade-off for the reliability gain.
+
+> **Operator can move the trigger or disable** if they want. The `ClaudeCodeTelegramDaemonHeal` task is decoupled from the main `ClaudeCodeTelegramDaemon` task; disabling it just removes the post-boot self-heal — manual recovery via the Desktop shortcut still works.
+
 ## File manifest
 
 | Path | Purpose |
@@ -676,6 +788,10 @@ Install-Block "$env:USERPROFILE\.claude\CLAUDE.md" $ruleNoSelect "<!-- BEGIN: no
 | `%USERPROFILE%\telegram-inbox\` | Safe destination for uploads |
 | Scheduled Task `ClaudeCodeTelegramDaemon` | Daemon auto-start at logon (hidden) |
 | Scheduled Task `ClaudeTelegramInboxMover` | Mover auto-start at logon (hidden) |
+| Scheduled Task `ClaudeCodeTelegramDaemonHeal` | Post-boot self-heal one-shot, AtLogOn + 90 s delay (Step 11) |
+| `%USERPROFILE%\fix-daemon.ps1` | Idempotent recovery script (Step 11) — run by heal task and by Desktop shortcut |
+| `%USERPROFILE%\fix-daemon.log` | Per-run log of the heal script (manual or scheduled) |
+| `%USERPROFILE%\Desktop\Fix Claude Telegram Daemon.cmd` | Double-click recovery shortcut (calls `fix-daemon.ps1`) |
 | `%USERPROFILE%\CLAUDE.md` + `~/.claude/CLAUDE.md` | Both rule blocks installed |
 
 ## Operating notes
