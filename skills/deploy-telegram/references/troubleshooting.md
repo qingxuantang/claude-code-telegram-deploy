@@ -222,6 +222,26 @@ If both rules are present but the daemon still doesn't follow them: **restart th
 
 ---
 
+## Symptom (Windows): double-clicked `.cmd` shortcut errors with `'M' 不是内部或外部命令` or similar single-letter error
+
+cmd.exe on Chinese-locale Windows (any non-UTF-8 ANSI codepage, but Chinese GBK is the common one) reads `.cmd`/`.bat` files using the **system ANSI codepage, NOT UTF-8**. If the file contains UTF-8 non-ASCII bytes (em-dash `—`, smart quotes `“”`, Chinese punctuation, etc.), cmd splits at misinterpreted byte boundaries and tries to execute leftover residue bytes as commands. Symptom: `'<single-letter>' 不是内部或外部命令` errors, often two or three in a row, before the actual command runs (if it runs at all).
+
+### Diagnose
+
+```powershell
+$bytes = [System.IO.File]::ReadAllBytes("<path-to-cmd-file>")
+$nonAscii = $bytes | Where-Object { $_ -gt 0x7F }
+"non-ASCII bytes: $($nonAscii.Count) (any value > 0 means cmd.exe may misinterpret)"
+```
+
+### Fix
+
+Rewrite the file as pure ASCII (replace `—` with `--`, smart quotes with plain, drop any Chinese characters). Write with `[System.Text.ASCIIEncoding]::new()` instead of `[System.Text.UTF8Encoding]::new($false)`.
+
+`.ps1` files are NOT affected — PowerShell reads them as UTF-8 and tolerates non-ASCII fine. The issue is strictly `.cmd`/`.bat` files because they're parsed by cmd.exe.
+
+---
+
 ## Symptom: claude session worked for hours, then suddenly stopped replying
 
 This is the **long-session drift** failure (see [`post-deploy-hardening.md`](./post-deploy-hardening.md) §7). Recovery:

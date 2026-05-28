@@ -754,11 +754,22 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Se
 
 ### 11c. Desktop shortcut for manual recovery (one-click "click when phone goes silent")
 
+> **Critical encoding lesson** (discovered 2026-05-28): `cmd.exe` on Chinese-locale Windows reads `.cmd`/`.bat` files using the **system ANSI codepage (GBK)**, NOT UTF-8. If the file contains UTF-8 non-ASCII characters (em-dashes, Chinese punctuation, etc.), cmd splits the file on misinterpreted byte boundaries and tries to execute leftover bytes as commands — producing cryptic errors like `'M' 不是内部或外部命令`. **Always write `.cmd`/`.bat` files as pure ASCII** (use `[System.Text.ASCIIEncoding]` not `[System.Text.UTF8Encoding]`). Note this only affects `.cmd`/`.bat` — `.ps1` files are read by PowerShell as UTF-8 and tolerate non-ASCII fine.
+
 ```powershell
 $shortcut = "$env:USERPROFILE\Desktop\Fix Claude Telegram Daemon.cmd"
-$cmdContent = "@echo off`r`nREM Click this when Telegram from phone doesn't reach Claude.`r`nREM Runs ~/fix-daemon.ps1 (idempotent — safe even if daemon is already healthy).`r`nREM Log: %USERPROFILE%\fix-daemon.log`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%USERPROFILE%\fix-daemon.ps1`"`r`necho.`r`necho Done. Check %USERPROFILE%\fix-daemon.log for details.`r`necho.`r`npause`r`n"
-[System.IO.File]::WriteAllText($shortcut, $cmdContent, [System.Text.UTF8Encoding]::new($false))
+# IMPORTANT: pure-ASCII content + ASCIIEncoding write — see callout above.
+# em-dash, Chinese, smart quotes etc. would all corrupt the file under cmd.exe.
+$cmdContent = "@echo off`r`nREM Click this when Telegram from phone doesn't reach Claude.`r`nREM Runs %USERPROFILE%\fix-daemon.ps1 (idempotent -- safe even if daemon is already healthy).`r`nREM Log written to %USERPROFILE%\fix-daemon.log`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%USERPROFILE%\fix-daemon.ps1`"`r`necho.`r`necho Done. Check %USERPROFILE%\fix-daemon.log for details.`r`necho.`r`npause`r`n"
+[System.IO.File]::WriteAllText($shortcut, $cmdContent, [System.Text.ASCIIEncoding]::new())
 "OK: $shortcut (double-click to fix daemon manually)"
+
+# Verify it's pure ASCII (no UTF-8 multi-byte sequences that would corrupt under cmd's GBK read):
+$bytes = [System.IO.File]::ReadAllBytes($shortcut)
+if ($bytes | Where-Object { $_ -gt 0x7F }) {
+    throw "Shortcut file has non-ASCII bytes — cmd.exe will misinterpret them on Chinese Windows. Rewrite content as pure ASCII."
+}
+"OK: shortcut is pure ASCII (safe for cmd.exe on any locale)"
 ```
 
 ### Test the heal flow once
