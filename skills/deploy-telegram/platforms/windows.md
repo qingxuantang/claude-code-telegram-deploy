@@ -668,11 +668,21 @@ Install-Block "$env:USERPROFILE\.claude\CLAUDE.md" $ruleNoSelect "<!-- BEGIN: no
 
 > **Why "kill daemon + respawn" is harmless even when daemon was healthy**: just-launched daemon has no session context to lose; just-launched Desktop App is unlikely to be using `mcp__plugin_telegram_telegram__*` tools yet; Telegram queues messages server-side for 24 h so the ~15-s respawn gap loses nothing. Idempotent by design.
 
-### 11a. Write the self-heal script
+### 11a. Install the self-heal script
+
+The script lives as a standalone file in this repo at [`../scripts/windows/fix-daemon.ps1`](../scripts/windows/fix-daemon.ps1) (also has its own [README](../scripts/windows/README.md) covering when and why to run it). **Preferred install** copies it from the skill directory:
 
 ```powershell
-$fix = "$env:USERPROFILE\fix-daemon.ps1"
-$fixContent = @'
+# Primary path: skill is installed at the canonical location
+$skillScripts = "$env:USERPROFILE\.claude\skills\deploy-telegram\scripts\windows"
+if (Test-Path "$skillScripts\fix-daemon.ps1") {
+    Copy-Item "$skillScripts\fix-daemon.ps1" "$env:USERPROFILE\fix-daemon.ps1" -Force
+    "OK: copied from $skillScripts"
+} else {
+    # Fallback for cases where the skill is loaded from a non-canonical path
+    # (e.g. URL-loaded skill). The heredoc below mirrors scripts/windows/fix-daemon.ps1
+    # — keep these in sync if you modify either.
+    $fixContent = @'
 # fix-daemon.ps1 — idempotent self-heal for the Telegram daemon.
 # Kills any bun whose root parent isn't claude --channels (i.e. Desktop App's
 # bun, which contends for the bot.pid slot), then kills the daemon claude
@@ -731,8 +741,9 @@ try {
 
 Log "=== fix-daemon done ==="
 '@
-[System.IO.File]::WriteAllText($fix, $fixContent, [System.Text.UTF8Encoding]::new($false))
-"OK: $fix"
+    [System.IO.File]::WriteAllText("$env:USERPROFILE\fix-daemon.ps1", $fixContent, [System.Text.UTF8Encoding]::new($false))
+    "OK: wrote $env:USERPROFILE\fix-daemon.ps1 (fallback heredoc — full version in scripts/windows/)"
+}
 ```
 
 ### 11b. Register the heal Scheduled Task (AtLogOn + 90 s delay, one-shot)
@@ -754,22 +765,30 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Se
 
 ### 11c. Desktop shortcut for manual recovery (one-click "click when phone goes silent")
 
+Standalone file: [`../scripts/windows/Fix Claude Telegram Daemon.cmd`](../scripts/windows/Fix%20Claude%20Telegram%20Daemon.cmd).
+
 > **Critical encoding lesson** (discovered 2026-05-28): `cmd.exe` on Chinese-locale Windows reads `.cmd`/`.bat` files using the **system ANSI codepage (GBK)**, NOT UTF-8. If the file contains UTF-8 non-ASCII characters (em-dashes, Chinese punctuation, etc.), cmd splits the file on misinterpreted byte boundaries and tries to execute leftover bytes as commands — producing cryptic errors like `'M' 不是内部或外部命令`. **Always write `.cmd`/`.bat` files as pure ASCII** (use `[System.Text.ASCIIEncoding]` not `[System.Text.UTF8Encoding]`). Note this only affects `.cmd`/`.bat` — `.ps1` files are read by PowerShell as UTF-8 and tolerate non-ASCII fine.
 
 ```powershell
 $shortcut = "$env:USERPROFILE\Desktop\Fix Claude Telegram Daemon.cmd"
-# IMPORTANT: pure-ASCII content + ASCIIEncoding write — see callout above.
-# em-dash, Chinese, smart quotes etc. would all corrupt the file under cmd.exe.
-$cmdContent = "@echo off`r`nREM Click this when Telegram from phone doesn't reach Claude.`r`nREM Runs %USERPROFILE%\fix-daemon.ps1 (idempotent -- safe even if daemon is already healthy).`r`nREM Log written to %USERPROFILE%\fix-daemon.log`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%USERPROFILE%\fix-daemon.ps1`"`r`necho.`r`necho Done. Check %USERPROFILE%\fix-daemon.log for details.`r`necho.`r`npause`r`n"
-[System.IO.File]::WriteAllText($shortcut, $cmdContent, [System.Text.ASCIIEncoding]::new())
-"OK: $shortcut (double-click to fix daemon manually)"
+$skillScripts = "$env:USERPROFILE\.claude\skills\deploy-telegram\scripts\windows"
+if (Test-Path "$skillScripts\Fix Claude Telegram Daemon.cmd") {
+    Copy-Item "$skillScripts\Fix Claude Telegram Daemon.cmd" $shortcut -Force
+    "OK: copied shortcut from $skillScripts"
+} else {
+    # Fallback. IMPORTANT: pure-ASCII content + ASCIIEncoding write — see callout above.
+    # em-dash, Chinese, smart quotes etc. would all corrupt the file under cmd.exe.
+    $cmdContent = "@echo off`r`nREM Click this when Telegram from phone doesn't reach Claude.`r`nREM Runs %USERPROFILE%\fix-daemon.ps1 (idempotent -- safe even if daemon is already healthy).`r`nREM Log written to %USERPROFILE%\fix-daemon.log`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%USERPROFILE%\fix-daemon.ps1`"`r`necho.`r`necho Done. Check %USERPROFILE%\fix-daemon.log for details.`r`necho.`r`npause`r`n"
+    [System.IO.File]::WriteAllText($shortcut, $cmdContent, [System.Text.ASCIIEncoding]::new())
+    "OK: wrote $shortcut (fallback heredoc — full version in scripts/windows/)"
+}
 
-# Verify it's pure ASCII (no UTF-8 multi-byte sequences that would corrupt under cmd's GBK read):
+# Verify it's pure ASCII regardless of which path was taken
 $bytes = [System.IO.File]::ReadAllBytes($shortcut)
 if ($bytes | Where-Object { $_ -gt 0x7F }) {
     throw "Shortcut file has non-ASCII bytes — cmd.exe will misinterpret them on Chinese Windows. Rewrite content as pure ASCII."
 }
-"OK: shortcut is pure ASCII (safe for cmd.exe on any locale)"
+"OK: shortcut is pure ASCII ($($bytes.Length) bytes, safe for cmd.exe on any locale)"
 ```
 
 ### Test the heal flow once
