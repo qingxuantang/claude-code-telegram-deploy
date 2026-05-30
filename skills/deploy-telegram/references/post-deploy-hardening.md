@@ -488,6 +488,61 @@ Reboot exposed the problem because the daemon process needs to re-load settings 
 
 ---
 
+## §13. macOS manual recovery script — `fix-telegram-daemon.command` (macOS-only)
+
+### Problem
+
+On macOS the daemon can land in any of four broken states that all look the same to the user (Telegram messages stop being answered):
+
+1. `bun server.ts` crashed but the parent `claude` is still alive — no respawn happens because nothing notices the bun is gone.
+2. Two `bun server.ts` processes are alive, contending for the bot token (a Desktop App's `claude --plugin-dir` and the daemon's `claude --channels` both spawned one). Whichever issued the most recent `bot.pid` SIGTERM wins — and on Mac this is non-deterministic, same as Windows §4.
+3. `claude` died but the supervising tmux session is still up. `start-claude.sh`'s while-loop *should* respawn it, but launchd / tmux / shell timing can occasionally leave the pane stuck.
+4. The whole `claude` tmux session is gone — usually a launchd hiccup after a heavy sleep/wake cycle.
+
+Manually diagnosing which one and applying the right remedy is annoying and error-prone, especially for a non-developer operator. We want a one-click recovery.
+
+### Solution
+
+`fix-telegram-daemon.command` is installed by Step 10 of [`../platforms/macos.md`](../platforms/macos.md) to `~/Desktop/`. Double-clicking it triggers a five-branch decision tree:
+
+| Detected state | Action |
+|---|---|
+| Multiple `bun server.ts` | Walk each bun's parent chain; keep the one whose grand/parent is the daemon's `claude`, `kill` the rest |
+| `bun` gone, `claude` alive | `kill` claude — `start-claude.sh`'s while-loop respawns the chain fresh (~15 s downtime) |
+| `claude` gone, `tmux` up | Wait up to 60 s for auto-restart; only `tmux send-keys` if the pane is provably idle |
+| `tmux` session gone | `tmux new-session -d -s claude ~/start-claude.sh` |
+| Everything healthy | Send one "all good" Telegram message, exit 0 |
+
+All five branches are idempotent — re-running converges to the same end state.
+
+### Why this is structured the way it is
+
+**`ps aux \| awk` instead of `pgrep -f`**: when the script runs from within a `claude` subprocess (e.g. operator asks Claude over Telegram to "run the fix script for me"), the subprocess sandbox prevents `pgrep -f` from seeing its own ancestors. `ps aux | awk` has no such restriction and works in every context.
+
+**Direct `curl` to Bot API for notifications, not the MCP `reply` tool**: the whole point of running this script is that the MCP pipeline may be broken. So `tg()` posts to `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage` directly. The user gets visible feedback ("starting repair", "repair complete", "repair failed") even when `mcp__plugin_telegram_telegram__reply` is fully dead.
+
+**`BOT_TOKEN` is read from `~/.claude/channels/telegram/.env` at run time, not hardcoded**: the script in this repo ships with **no secrets**. The deploy-telegram skill writes `.env` during Step 6, so by the time the script gets installed in Step 10, the token is already there. If the `.env` is missing or unreadable, notifications are skipped silently and the kill/restart logic still runs.
+
+**`CHAT_ID` is `<CHAT_ID>` until install time**: Step 10 uses `sed` to substitute the operator's Telegram user_id. If the placeholder is still present at run time (someone copied the script manually without the install step), notifications are skipped silently and the kill/restart logic still runs.
+
+**`tmux send-keys` is guarded by an idle check**: if `claude` is dead but `tmux` is still up, the script waits up to 60 s for `start-claude.sh`'s while-loop to auto-respawn. Only if that times out *and* `tmux display-message -p '#{pane_current_command}'` returns something other than `bash` / `sh` (i.e. the pane is actually idle) does it inject `exec bash $START_SCRIPT`. This prevents the script from spamming `Enter` into a still-running `start-claude.sh` and corrupting its state.
+
+### Why NOT auto-fire on logon (unlike Windows)
+
+The Windows version (`fix-daemon.ps1`) is registered as a Scheduled Task that fires 90 s after each logon, because the Windows bot.pid race is a *guaranteed* contention every reboot. macOS doesn't have the same boot-time guarantee — the daemon's launchd plist + `start-claude.sh` while-loop already handle most reboot cases cleanly. The Mac script stays **manual-only**: a defensive safety net when sleep/wake or transient launchd issues leave the daemon stuck, not an unconditional reboot ritual.
+
+If you want symmetry with Windows, you can wrap `fix-telegram-daemon.command` in a launchd `RunAtLoad=true` plist — but the trade-off (extra ~15 s daemon downtime on every login, for negligible reliability gain on most macOS deployments) is not worth it by default.
+
+### Production validation
+
+The script was developed and field-tested across multiple incidents on the Mac mini deployment (Darwin 24.6.0 arm64) between 2026-05-22 and 2026-05-31, refining the five-branch decision tree from production observations of each failure mode.
+
+### What this section does NOT cover
+
+- The script does not address the **root cause** of any of the four broken states — it just brings the daemon back to a known-good state. Root causes for the contention case are in §4; for UTF-8 corruption-induced crashes in §10; for 2.1.149 plugin-load failure in §12.
+
+---
+
 ## Verifying a healthy deployment
 
 After running the skill, the following sanity checks should all pass:

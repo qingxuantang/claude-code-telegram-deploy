@@ -816,6 +816,120 @@ Then send a test message from the phone and confirm a reply lands.
 
 > Full pairing details in [`../references/pairing-and-access.md`](../references/pairing-and-access.md).
 
+## Step 10 — 🤖 Install desktop fix script (`fix-telegram-daemon.command`)
+
+> **Why this exists**: when the Telegram pipeline goes silent (bun crashed, claude died, tmux session vanished, or two `bun` processes are contending for the bot token), the operator wants a single double-click to get back to a known-good state. This step deploys [`../scripts/macos/fix-telegram-daemon.command`](../scripts/macos/fix-telegram-daemon.command) to the user's Desktop and substitutes their Telegram user_id so the script can notify them about repair progress.
+
+> **Idempotent and defensive**: see the script's standalone [README](../scripts/macos/README.md) for the five-case decision tree. Safe to run on a healthy system (just sends one "all good" Telegram message and exits 0).
+
+The script lives as a standalone file in this repo at [`../scripts/macos/fix-telegram-daemon.command`](../scripts/macos/fix-telegram-daemon.command). **Preferred install** copies it from the skill directory:
+
+```bash
+# Primary path: skill is installed at the canonical location
+SKILL_SCRIPTS="$HOME/.claude/skills/deploy-telegram/scripts/macos"
+DEST="$HOME/Desktop/fix-telegram-daemon.command"
+
+if [ -r "$SKILL_SCRIPTS/fix-telegram-daemon.command" ]; then
+    cp "$SKILL_SCRIPTS/fix-telegram-daemon.command" "$DEST"
+    echo "OK: copied from $SKILL_SCRIPTS"
+else
+    # Fallback for cases where the skill is loaded from a non-canonical
+    # path (e.g. URL-loaded skill). The heredoc below mirrors
+    # scripts/macos/fix-telegram-daemon.command — keep these in sync if
+    # you modify either. (Trimmed for brevity; canonical version lives
+    # in scripts/macos/.)
+    cat > "$DEST" <<'FIXEOF'
+#!/bin/bash
+# fix-telegram-daemon.command — see scripts/macos/ for the full source.
+# Idempotent manual self-heal for the Claude Code <-> Telegram pipeline.
+
+ENV_FILE="$HOME/.claude/channels/telegram/.env"
+BOT_TOKEN=""
+if [ -r "$ENV_FILE" ]; then
+    BOT_TOKEN=$(awk -F= '/^TELEGRAM_BOT_TOKEN=/{ sub(/^TELEGRAM_BOT_TOKEN=/, "", $0); gsub(/[[:space:]"\047]/, "", $0); print; exit }' "$ENV_FILE")
+fi
+CHAT_ID='<CHAT_ID>'
+LOG="$HOME/fix-telegram-daemon.log"
+START_SCRIPT="$HOME/start-claude.sh"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+tg() {
+    [ -z "$BOT_TOKEN" ] && return 0
+    case "$CHAT_ID" in '<CHAT_ID>'|''|'<'*'>') return 0 ;; esac
+    curl -sf --max-time 8 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=$1" >/dev/null 2>&1
+}
+
+CLAUDE_PID=$(ps aux | awk '/claude --dangerously-skip-permissions/ && !/awk/ {print $2}' | head -1)
+BUN_PIDS=($(ps aux | awk '/bun server\.ts/ && !/awk/ {print $2}'))
+BUN_COUNT=${#BUN_PIDS[@]}
+TMUX_OK=$(tmux has-session -t claude 2>/dev/null && echo yes || echo no)
+
+log "=== Fix started ===  claude=${CLAUDE_PID:-none}  bun=${BUN_PIDS[*]:-none}  tmux=$TMUX_OK"
+
+if [ "$BUN_COUNT" -gt 1 ]; then
+    KEEP=""
+    [ -n "$CLAUDE_PID" ] && for pid in "${BUN_PIDS[@]}"; do
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        gppid=$(ps -o ppid= -p "$ppid" 2>/dev/null | tr -d ' ')
+        if [ "$gppid" = "$CLAUDE_PID" ] || [ "$ppid" = "$CLAUDE_PID" ]; then KEEP="$pid"; break; fi
+    done
+    for pid in "${BUN_PIDS[@]}"; do [ "$pid" = "$KEEP" ] && continue; kill "$pid" 2>/dev/null; log "killed rogue bun $pid"; done
+    sleep 2
+fi
+
+if [ -z "$(ps aux | awk '/bun server\.ts/ && !/awk/ {print $2}')" ] && [ -n "$CLAUDE_PID" ]; then
+    kill "$CLAUDE_PID" 2>/dev/null; log "killed claude $CLAUDE_PID for respawn"
+    tg "Claude daemon: restarting..."; sleep 15
+elif [ -z "$CLAUDE_PID" ] && [ "$TMUX_OK" = "no" ]; then
+    export PATH="$HOME/.bun/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:$PATH"
+    tmux new-session -d -s claude "$START_SCRIPT"; log "recreated tmux session"
+    tg "Claude daemon: tmux recreated"; sleep 12
+fi
+
+NC=$(ps aux | awk '/claude --dangerously-skip-permissions/ && !/awk/ {print $2}' | head -1)
+NB=$(ps aux | awk '/bun server\.ts/ && !/awk/ {print $2}' | head -1)
+log "=== Fix done ===  claude=${NC:-none}  bun=${NB:-none}"
+[ -n "$NC" ] && [ -n "$NB" ] && tg "OK Claude daemon healthy (claude=$NC, bun=$NB)" && exit 0
+tg "FAIL Claude daemon could not be recovered — run: tmux attach -t claude"
+exit 1
+FIXEOF
+    echo "OK: wrote fallback to $DEST (full version in scripts/macos/)"
+fi
+
+chmod +x "$DEST"
+
+# Substitute the operator's Telegram user_id into the CHAT_ID placeholder.
+# USER_TELEGRAM_ID is one of the universal Required inputs for this skill;
+# if you do not have it yet, run /telegram:access list after Step 9c to
+# read it from access.json's allowFrom array.
+if [ -n "$USER_TELEGRAM_ID" ]; then
+    sed -i.bak "s|<CHAT_ID>|$USER_TELEGRAM_ID|g" "$DEST"
+    rm "$DEST.bak"
+    echo "OK: substituted CHAT_ID=$USER_TELEGRAM_ID"
+else
+    echo "WARN: USER_TELEGRAM_ID not set — fix script will run without Telegram notifications until you sed it in manually"
+fi
+```
+
+Verify the install:
+
+```bash
+# 1. File exists, is executable, no placeholder left
+test -x "$HOME/Desktop/fix-telegram-daemon.command" && echo "OK: executable"
+grep -q '<CHAT_ID>' "$HOME/Desktop/fix-telegram-daemon.command" \
+    && echo "WARN: <CHAT_ID> placeholder still present — sed it manually" \
+    || echo "OK: CHAT_ID substituted"
+
+# 2. Dry-run the healthy path: BOT_TOKEN should be readable from .env
+awk -F= '/^TELEGRAM_BOT_TOKEN=/{print "OK: BOT_TOKEN in .env (len=" length($2) ")"}' \
+    "$HOME/.claude/channels/telegram/.env"
+```
+
+Tell the user: **"Double-click `fix-telegram-daemon.command` on your Desktop if Telegram ever stops responding. Safe to run anytime — it diagnoses first, only acts if needed, sends you a Telegram message either way."**
+
+Full design notes (when to use, what each branch does, why `ps aux | awk` instead of `pgrep -f`, why direct `curl` instead of MCP) live in the script's [README](../scripts/macos/README.md).
+
 ## File manifest
 
 | Path | Purpose | Perms |
@@ -834,6 +948,8 @@ Then send a test message from the phone and confirm a reply lands.
 | `~/CLAUDE.md` + `~/.claude/CLAUDE.md` | Three rule blocks installed (channel routing + no-interactive-select + macOS-FDA-self-check) | 644 |
 | `~/Library/Logs/claude-telegram.log` | launchd stderr/stdout | 644 |
 | `~/telegram-inbox/` | Safe destination for uploads | 755 |
+| `~/Desktop/fix-telegram-daemon.command` | Manual recovery (Step 10) — double-click when Telegram goes silent | 755 |
+| `~/fix-telegram-daemon.log` | Recovery script log (written each run, append-mode) | 644 |
 | **System Settings FDA grant for `claude.exe`** | One-time GUI grant (Step 7e) to give claude subprocesses TCC access to protected paths | n/a (GUI, SIP-protected TCC.db) |
 
 ## Compatibility
