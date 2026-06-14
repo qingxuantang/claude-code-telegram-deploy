@@ -612,6 +612,61 @@ Restart the daemon (or just wait for the next launch) for the warning to clear.
 
 ---
 
+## §15. Windows Scheduled Tasks silently don't run on battery (Windows laptops)
+
+### Symptom
+
+On a Windows **laptop**, Telegram is dead after *every* reboot and stays dead until you manually run the desktop fix script — even though the post-boot self-heal Scheduled Task (`ClaudeCodeTelegramDaemonHeal`, §4 / Step 11) is registered and `Enabled`. Triggering the heal task manually with `Start-ScheduledTask` appears to "succeed" (`LastTaskResult = 0`) but does nothing: no new line in `fix-daemon.log`, the daemon PID doesn't change, the contending bun isn't killed.
+
+The same machine, **plugged into AC**, heals normally — the heal task fires 90 s after logon and the daemon recovers.
+
+### Cause
+
+`New-ScheduledTaskSettingsSet` **defaults** to:
+
+```
+DisallowStartIfOnBatteries = True
+StopIfGoingOnBatteries     = True
+```
+
+So any task registered without overriding these is **blocked by Windows whenever the machine is on battery power** — including manual `Start-ScheduledTask` triggers. Windows still records `LastTaskResult = 0` and updates `LastRunTime`, which makes the task look like it ran; in reality the action was never launched. A laptop that boots on battery (lid-open resume, unplugged reboot, etc.) therefore never runs its self-heal, and the post-boot bot-token race (§4) is never repaired.
+
+This is insidious because:
+- It's invisible on a desktop / always-plugged machine — the task works fine in testing.
+- The `LastTaskResult = 0` "success" actively misleads diagnosis.
+- It interacts with §4: the race breaks Telegram every boot, and the one thing that would fix it is itself battery-blocked.
+
+> Historical note: the operator's instinct ("is this related to running on battery?") was correct well before the mechanism was found. When a Windows-laptop deployment fails *only* after some reboots, check battery state early.
+
+### Fix
+
+Register every self-heal / supervisor / mover task with the battery overrides:
+
+```powershell
+$settingsTask = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+```
+
+`-AllowStartIfOnBatteries` clears `DisallowStartIfOnBatteries`; `-DontStopIfGoingOnBatteries` clears `StopIfGoingOnBatteries`. A heal task that only runs while plugged in is worthless — these flags are mandatory, not optional, for any always-on background task on a laptop.
+
+To fix an already-registered task in place without re-running the skill:
+
+```powershell
+foreach ($tn in 'ClaudeCodeTelegramDaemon','ClaudeCodeTelegramDaemonHeal','ClaudeTelegramInboxMover') {
+    $t = Get-ScheduledTask -TaskName $tn
+    $t.Settings.DisallowStartIfOnBatteries = $false
+    $t.Settings.StopIfGoingOnBatteries     = $false
+    Set-ScheduledTask -TaskName $tn -Settings $t.Settings | Out-Null
+}
+```
+
+### How to confirm it was the cause
+
+Plug in to AC, then `Start-ScheduledTask -TaskName ClaudeCodeTelegramDaemonHeal` and watch `fix-daemon.log` + the daemon PID. If it runs on AC but not on battery, the battery flags are the culprit. The platform overlay's Step 8, Step 11b, and the inbox-mover registration now all set these flags by default.
+
+---
+
 ## Verifying a healthy deployment
 
 After running the skill, the following sanity checks should all pass:

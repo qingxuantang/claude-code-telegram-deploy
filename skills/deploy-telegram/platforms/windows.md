@@ -523,7 +523,7 @@ while (`$true) { Start-Sleep -Seconds 3600 }
 $taskName = "ClaudeTelegramInboxMover"
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$moverScript`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-$settingsTask = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 365)
+$settingsTask = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 365) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries  # battery flags: laptops boot on battery; without these the task silently won't start (see Step 11b note)
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -542,7 +542,7 @@ $taskName = "ClaudeCodeTelegramDaemon"
 $startScript = "$env:USERPROFILE\start-claude.ps1"
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$startScript`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-$settingsTask = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 365)
+$settingsTask = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 365) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries  # battery flags: laptops boot on battery; without these the task silently won't start (see Step 11b note)
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -761,8 +761,16 @@ $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$env:USERPROFILE\fix-daemon.ps1`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $trigger.Delay = 'PT90S'   # 90 s after logon — lets daemon + Desktop App both settle first
+# CRITICAL: -AllowStartIfOnBatteries + -DontStopIfGoingOnBatteries.
+# New-ScheduledTaskSettingsSet DEFAULTS to DisallowStartIfOnBatteries=True and
+# StopIfGoingOnBatteries=True. On a LAPTOP that boots on battery, those defaults
+# silently block this heal task — it never fires, the post-boot bot-token race is
+# never repaired, and Telegram stays dead until a manual run. (Production bug,
+# 2026-06-14: laptop booting on battery → heal never ran → TG dead every reboot.)
+# A heal task is useless if it only runs while plugged in, so override both.
 $settingsTask = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
