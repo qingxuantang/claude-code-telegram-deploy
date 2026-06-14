@@ -149,7 +149,7 @@ if ($settings.PSObject.Properties.Name -contains 'channelsEnabled') {
 # Recommended permissions config — only set if user hasn't already configured
 if (-not $settings.permissions) {
     $perms = New-Object PSObject
-    $perms | Add-Member -NotePropertyName allow -NotePropertyValue @("Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "WebSearch(*)", "WebFetch(*)", "NotebookEdit(*)", "mcp__*")
+    $perms | Add-Member -NotePropertyName allow -NotePropertyValue @("Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "WebSearch(*)", "WebFetch(*)", "NotebookEdit(*)", "mcp__plugin_telegram_telegram__*")
     $perms | Add-Member -NotePropertyName deny -NotePropertyValue @()
     $perms | Add-Member -NotePropertyName defaultMode -NotePropertyValue "bypassPermissions"
     $settings | Add-Member -NotePropertyName permissions -NotePropertyValue $perms
@@ -161,6 +161,13 @@ if (-not $settings.permissions) {
             $settings.permissions | Add-Member -NotePropertyName defaultMode -NotePropertyValue 'bypassPermissions'
         }
         "Set permissions.defaultMode = bypassPermissions"
+    }
+    # CC 2.1.170+ rejects a bare "mcp__*" in allow rules (globs are only allowed
+    # in the tool position after a literal mcp__<server>__ prefix). Strip any
+    # legacy "mcp__*" left over from an older install so the daemon stops warning.
+    if ($settings.permissions.PSObject.Properties.Name -contains 'allow' -and $settings.permissions.allow -contains 'mcp__*') {
+        $settings.permissions.allow = @($settings.permissions.allow | Where-Object { $_ -ne 'mcp__*' })
+        "Removed legacy invalid allow rule: mcp__*"
     }
 }
 

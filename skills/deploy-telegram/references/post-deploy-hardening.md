@@ -543,6 +543,75 @@ The script was developed and field-tested across multiple incidents on the Mac m
 
 ---
 
+## §14. Claude Code 2.1.170+ rejects bare `mcp__*` in `allow` rules (universal)
+
+### Symptom
+
+On launch (daemon window or any `claude` session), a startup warning appears:
+
+```
+Settings Warning
+  ~/.claude/settings.json
+   └ permissions
+     └ allow: Invalid permission rule "mcp__*" was skipped: Wildcard tool name
+       "mcp__*" is not supported in allow rules. An allow pattern must name the
+       scope it widens — globs are permitted only in the tool position after a
+       literal mcp__<server>__ prefix. Deny and ask rules accept wildcards anywhere.
+  The values listed above were skipped; the rest of the file is in effect.
+```
+
+`/doctor` also flags it as a setup issue. The rest of `settings.json` still loads — this is a warning, not a fatal error — but it prints on every launch and is noise.
+
+### Cause
+
+Earlier versions of this skill wrote `"mcp__*"` into `permissions.allow` to auto-allow all MCP tools. **Claude Code 2.1.170 tightened `allow`-rule validation**: a glob in an allow rule may now appear *only* in the tool position after a literal `mcp__<server>__` prefix. `deny` and `ask` rules still accept wildcards anywhere — only `allow` is restricted. A bare `mcp__*` (glob in the server position) is therefore rejected and skipped.
+
+### Fix
+
+Replace the bare wildcard with a server-scoped one. For this skill the only MCP server that matters is the Telegram plugin, whose tools are namespaced `mcp__plugin_telegram_telegram__*`:
+
+```jsonc
+// permissions.allow
+"NotebookEdit(*)",
+"mcp__plugin_telegram_telegram__*"   // was: "mcp__*"
+```
+
+> Note: this skill always sets `permissions.defaultMode: "bypassPermissions"`, under which the entire `allow` list is redundant (everything is allowed regardless). So removing `mcp__*` outright is equally valid functionally. The server-scoped rule is kept only to preserve intent for operators who later switch `defaultMode` away from bypass.
+
+The platform install steps now write the valid rule on fresh installs, and the Windows overlay's else-branch (existing-`permissions` case) actively strips any legacy `mcp__*` so a re-deploy self-heals an older install. Linux/macOS use a `set()`-based merge that `.discard("mcp__*")`s the legacy value on every run.
+
+### To fix an already-deployed machine without re-running the skill
+
+```bash
+# Linux / macOS
+python3 - <<'PY'
+import json, os
+p = os.path.expanduser('~/.claude/settings.json')
+d = json.load(open(p))
+allow = [a for a in d.get('permissions', {}).get('allow', []) if a != 'mcp__*']
+if 'mcp__plugin_telegram_telegram__*' not in allow:
+    allow.append('mcp__plugin_telegram_telegram__*')
+d['permissions']['allow'] = allow
+json.dump(d, open(p, 'w'), indent=4)
+print('fixed')
+PY
+```
+
+```powershell
+# Windows (UTF-8, no BOM)
+$p = "$env:USERPROFILE\.claude\settings.json"
+$j = Get-Content $p -Raw | ConvertFrom-Json
+$j.permissions.allow = @($j.permissions.allow | Where-Object { $_ -ne 'mcp__*' })
+if ($j.permissions.allow -notcontains 'mcp__plugin_telegram_telegram__*') {
+    $j.permissions.allow += 'mcp__plugin_telegram_telegram__*'
+}
+[System.IO.File]::WriteAllText($p, ($j | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+```
+
+Restart the daemon (or just wait for the next launch) for the warning to clear.
+
+---
+
 ## Verifying a healthy deployment
 
 After running the skill, the following sanity checks should all pass:

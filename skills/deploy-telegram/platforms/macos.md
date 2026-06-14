@@ -153,7 +153,11 @@ d = json.load(open(p)) if os.path.exists(p) else {}
 
 perms = d.setdefault('permissions', {})
 allow = set(perms.get('allow', []))
-allow.update(["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "WebSearch(*)", "WebFetch(*)", "NotebookEdit(*)", "mcp__*"])
+allow.update(["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "WebSearch(*)", "WebFetch(*)", "NotebookEdit(*)", "mcp__plugin_telegram_telegram__*"])
+# NOTE: CC 2.1.170+ rejects a bare "mcp__*" in allow rules — globs are only
+# permitted in the tool position after a literal mcp__<server>__ prefix.
+# Drop any legacy "mcp__*" left over from older installs so it doesn't warn:
+allow.discard("mcp__*")
 perms['allow'] = sorted(allow)
 perms.setdefault('deny', [])
 perms['defaultMode'] = 'bypassPermissions'
