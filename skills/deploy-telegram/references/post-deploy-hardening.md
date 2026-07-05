@@ -667,6 +667,65 @@ Plug in to AC, then `Start-ScheduledTask -TaskName ClaudeCodeTelegramDaemonHeal`
 
 ---
 
+## §16. `claude --channels` under bare systemd (no PTY) crash-loops with a `--print` error (Linux)
+
+### Symptom
+
+After a reboot, a Linux daemon that is supposed to auto-start via a systemd **user** service is dead. `systemctl --user is-active claude-telegram.service` may even report `active`, but:
+
+- No `claude` and no `bun server.ts` processes exist.
+- `~/.claude/channels/telegram/bot.pid` is missing.
+- `journalctl --user -u claude-telegram.service` shows a tight restart loop:
+
+```
+start-claude.sh[NNN]: Error: Input must be provided either through stdin or as a prompt argument when using --print
+start-claude.sh[NNN]: Claude exited. Restarting in 3s...
+```
+
+Inbound Telegram messages queue server-side (a `getUpdates` from elsewhere returns them with no 409, proving nothing is polling the bot).
+
+### Cause
+
+`claude --channels` is an **interactive** mode — it needs a controlling PTY. When the service's `ExecStart` runs the launcher **directly** (`ExecStart=%h/start-claude.sh`) under systemd, the process has no TTY (systemd sets `StandardInput` to null / a pipe). Modern Claude Code, seeing no TTY, falls back to non-interactive `--print` mode, which requires piped/argument input — so it exits immediately with the error above, and `start-claude.sh`'s `while` loop (or `Restart=always`) respawns it every few seconds forever.
+
+This is the same reason the trust dialog (§1) can't be dismissed on a headless unit: claude tries to render the "Is this a project you trust?" prompt, has no TTY to render it on, and collapses into the identical `--print` error. So on a bare-systemd deploy, **both** the missing PTY *and* an unaccepted trust flag surface as the exact same crash — check both.
+
+### Fix
+
+Give claude a PTY. Two equivalent options:
+
+1. **tmux (the skill's canonical Linux pattern, [`platforms/linux.md`](../platforms/linux.md) Step 7):**
+
+   ```ini
+   ExecStart=/usr/bin/tmux new-session -d -s claude %h/start-claude.sh
+   ExecStop=/usr/bin/tmux kill-session -t claude
+   RemainAfterExit=yes
+   Restart=on-failure
+   ```
+
+   tmux allocates the PTY; it's also what Steps 8/10/11 drive with `send-keys` to dismiss first-launch dialogs and pair.
+
+2. **`script` PTY allocator (no tmux dependency, cleaner direct supervision):**
+
+   ```ini
+   Type=simple
+   ExecStart=/usr/bin/script -q -e -c "%h/start-claude.sh" /dev/null
+   Restart=always
+   RestartSec=10
+   ```
+
+   `script -q -e -c CMD /dev/null` runs `CMD` under a fresh pseudo-terminal, quietly, discarding the typescript. `start-claude.sh`'s own `while` loop still restarts claude on exit; `Restart=always` catches whole-wrapper death.
+
+Also ensure the trust flag is pre-seeded (§1): `projects["<cwd>"].hasTrustDialogAccepted = true` in `~/.claude.json` (the daemon's cwd is `$HOME` because `start-claude.sh` does `cd ~`).
+
+### How to confirm it was the cause
+
+Run the launcher once inside a PTY by hand — `tmux new-session -d -s t ~/start-claude.sh` (or the `script` line) — then check for `claude` + `bun server.ts` and a populated `bot.pid`. If it comes up under a PTY but crash-loops as a bare `ExecStart=%h/start-claude.sh` unit, the missing PTY is the cause.
+
+> Discovered 2026-07-05 on a production Linux server whose systemd unit predated the tmux-based Step 7: after its most recent reboot the service had been silently crash-looping (bare `ExecStart`, plus an unaccepted trust flag and a `disabled` unit) and Telegram had been dark the whole time. Fix: `enable` the unit, pre-seed `hasTrustDialogAccepted`, and switch `ExecStart` to a PTY wrapper.
+
+---
+
 ## Verifying a healthy deployment
 
 After running the skill, the following sanity checks should all pass:

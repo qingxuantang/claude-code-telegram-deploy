@@ -330,6 +330,20 @@ ENDSETUP
 
 > See [`../references/process-supervisors.md`](../references/process-supervisors.md) §Linux for why `RemainAfterExit=yes` + `Restart=on-failure` is the canonical pattern.
 
+> **⚠️ The tmux wrapper is load-bearing — `claude --channels` needs a PTY.** The `ExecStart` above deliberately launches `start-claude.sh` **inside a tmux session**, not directly, because tmux gives claude a pseudo-terminal. Do **not** "simplify" it to `ExecStart=%h/start-claude.sh`. Under bare systemd there is no TTY, so `claude --channels` silently drops into non-interactive `--print` mode and crash-loops every few seconds with:
+>
+> ```
+> Error: Input must be provided either through stdin or as a prompt argument when using --print
+> ```
+>
+> The daemon never reaches channel-listen mode, no bun spawns, and Telegram goes dark — while `systemctl is-active` still says `active` and journal just shows the restart loop. (Production incident 2026-07-05: a server whose service unit predated this tmux-based step ran the launcher bare and had been dead since its last reboot.) If you have a hard reason to avoid tmux, wrap the launcher in a PTY allocator instead — `Type=simple`, `Restart=always`, and:
+>
+> ```ini
+> ExecStart=/usr/bin/script -q -e -c "%h/start-claude.sh" /dev/null
+> ```
+>
+> `script` allocates a PTY the same way tmux does. See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §16. Note also that on a bare-systemd (no-PTY) unit the [trust dialog](../references/post-deploy-hardening.md) (§1) manifests as this *same* `--print` error rather than a visible prompt, so pre-seeding `hasTrustDialogAccepted` (§1) is doubly important for headless reboots.
+
 ## Step 7b — 🤖 systemd path-unit for inbox mover
 
 ```bash
