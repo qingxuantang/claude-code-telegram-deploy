@@ -566,6 +566,24 @@ Settings Warning
 
 Earlier versions of this skill wrote `"mcp__*"` into `permissions.allow` to auto-allow all MCP tools. **Claude Code 2.1.170 tightened `allow`-rule validation**: a glob in an allow rule may now appear *only* in the tool position after a literal `mcp__<server>__` prefix. `deny` and `ask` rules still accept wildcards anywhere — only `allow` is restricted. A bare `mcp__*` (glob in the server position) is therefore rejected and skipped.
 
+### Severity escalates on newer Claude Code — a *blocking* startup dialog that wedges headless daemons
+
+On even newer Claude Code (observed on 2.1.207), the same invalid rule is **no longer a passive, auto-skipped warning** — it is rendered as an **interactive dialog that blocks startup** until someone answers it:
+
+```
+Settings Warning
+  ~/.claude/settings.json
+   └ permissions.allow: Invalid permission rule "mcp__*" was skipped ...
+  ❯ 1. Continue
+    2. Fix with Claude
+    3. Exit and fix manually
+  Enter to confirm · Esc to cancel
+```
+
+A human at a terminal just presses Enter and moves on. **A headless daemon has nobody to press a key.** The `claude --channels` process sits on this modal forever, never reaches "Listening for channel messages", and the Telegram poller never comes up — so Telegram goes fully dark. Worse, it recurs on **every** restart/reboot, so it also silently defeats any auto-start (systemd / launchd / Scheduled Task) and any self-heal that respawns the daemon: each fresh process just re-wedges on the same dialog.
+
+This flips the issue from cosmetic to **daemon-fatal**. For any unattended deployment, removing the legacy `mcp__*` is **mandatory, not optional** — treat it as a release blocker for the daemon, not a nice-to-have cleanup. (Discovered in production 2026-07-12: a long-running daemon that was force-restarted onto a newer Claude Code wedged on this dialog on every respawn and never reached listening state until the rule was stripped.)
+
 ### Fix
 
 Replace the bare wildcard with a server-scoped one. For this skill the only MCP server that matters is the Telegram plugin, whose tools are namespaced `mcp__plugin_telegram_telegram__*`:
