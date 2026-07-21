@@ -13,13 +13,14 @@ Standalone, drop-in copies of the Step 11 self-heal artifacts from [`../../platf
 
 Idempotent post-boot self-heal:
 
+0. **Ensure the supervisor is alive.** If no `powershell.exe` is running `start-claude.ps1`, the daemon has no respawner — most commonly because the `ClaudeCodeTelegramDaemon` task hit its `ExecutionTimeLimit` and Windows terminated it (`RestartCount` does *not* rescue a time-limit kill). Steps 1-3 would then just leave `daemon-claude=0`. So `Start-ScheduledTask ClaudeCodeTelegramDaemon` first and wait for the supervisor to come up. (See [`../../references/post-deploy-hardening.md`](../../references/post-deploy-hardening.md) §17.)
 1. Enumerates every `bun.exe` process; walks the parent chain to find each one's "root parent" claude.exe.
 2. If the root parent's command line does NOT contain `--channels`, that bun belongs to the Desktop App (which loaded the Telegram plugin in `--plugin-dir` skills mode) and is contending for the bot's `getUpdates` slot. **Kill it.**
 3. Kill the daemon's `claude.exe` (`--channels` mode) too, so `start-claude.ps1`'s while-loop respawns it with a fresh bun.
 4. Wait 20 s, then verify end state (`daemon-claude=1, bun=2`) and a clean Telegram `getUpdates`.
 5. Append a timestamped result line to `%USERPROFILE%\fix-daemon.log`.
 
-End state is deterministic: **daemon-solo**, regardless of who originally won the post-boot race.
+End state is deterministic: **daemon-solo**, regardless of who originally won the post-boot race — and now regardless of whether the supervisor was alive when you started.
 
 ### Why this is safe to run defensively
 

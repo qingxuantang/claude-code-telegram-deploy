@@ -9,6 +9,12 @@
 # bun child, so Telegram messages silently queue server-side.
 #
 # This script:
+#   0. Ensures the supervisor (start-claude.ps1) is alive. If the
+#      ClaudeCodeTelegramDaemon task was terminated — most commonly
+#      because it hit its ExecutionTimeLimit (Windows kills the task at
+#      that point, and RestartCount does NOT cover a time-limit kill) —
+#      nobody respawns the daemon, so Steps 1-2 would just leave
+#      daemon-claude=0. This step re-launches the task to rebuild it.
 #   1. Kills any bun whose root parent is NOT `claude --channels`
 #      (i.e. the Desktop App's bun, which contends for bot.pid).
 #   2. Kills the daemon's claude.exe itself so start-claude.ps1's
@@ -35,6 +41,32 @@ function Log($msg) {
 }
 
 Log "=== fix-daemon start ==="
+
+# 0. Ensure the supervisor (start-claude.ps1) is alive. If it's gone — most
+#    commonly because the ClaudeCodeTelegramDaemon task hit its ExecutionTimeLimit
+#    and Windows terminated it (RestartCount does NOT rescue a time-limit kill) —
+#    nobody respawns the daemon, and the kill steps below would just leave
+#    daemon-claude=0. Rebuild the supervisor by (re)starting the task first.
+$supervisor = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*start-claude.ps1*' }
+if (-not $supervisor) {
+    Log "supervisor (start-claude.ps1) NOT running — starting ClaudeCodeTelegramDaemon task to rebuild it"
+    try {
+        Start-ScheduledTask -TaskName 'ClaudeCodeTelegramDaemon' -ErrorAction Stop
+        for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 2
+            $supervisor = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -like '*start-claude.ps1*' }
+            if ($supervisor) { break }
+        }
+        if ($supervisor) { Log "  supervisor rebuilt (PID=$(($supervisor | Select-Object -First 1).ProcessId))" }
+        else { Log "  WARN supervisor still down after starting task — check ClaudeCodeTelegramDaemon" }
+    } catch {
+        Log "  failed to start ClaudeCodeTelegramDaemon task: $($_.Exception.Message)"
+    }
+} else {
+    Log "supervisor alive (PID=$(($supervisor | Select-Object -First 1).ProcessId))"
+}
 
 # 1. Find all bun.exe processes and identify which ones belong to a
 #    NON-daemon parent (i.e. Desktop App's claude.exe with --plugin-dir).

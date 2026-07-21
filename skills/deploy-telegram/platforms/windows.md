@@ -562,6 +562,8 @@ Start-Process powershell.exe -ArgumentList "-NoProfile","-NoExit","-ExecutionPol
 
 > **Why visible-window manual launch instead of `tmux send-keys`**: Linux/macOS servers are headless and use tmux automation. Windows local PC has a human at the keyboard — two keypresses beat 200 lines of fragile SendKeys simulation. See [`../references/process-supervisors.md`](../references/process-supervisors.md) §Windows.
 
+> **⚠️ `ExecutionTimeLimit` is a fuse on the supervisor — mind it.** The task above sets `-ExecutionTimeLimit (New-TimeSpan -Days 365)`. That value is deliberately **finite, not `PT0S` (unlimited)** — a runaway supervisor should eventually be reaped rather than run forever unattended. But understand the trade-off: `start-claude.ps1` is a `while ($true)` loop that never exits on its own, so on a machine that stays up longer than the limit, **Windows terminates the supervisor when it hits `ExecutionTimeLimit`** — and `RestartCount` does **NOT** rescue a time-limit kill (it only restarts on failure exit, not on a forced timeout stop). The supervisor dies silently (no exit logged), nobody respawns the daemon, and Telegram goes dark until the next logon. Production incident 2026-07-21: a deployment whose task carried a **72-hour** limit ran on a laptop that stayed up 4 days — the supervisor was killed at the 72 h mark and never came back; `fix-daemon.log` showed `daemon-claude=0`, and re-running the heal alone couldn't help (nothing to respawn). **Mitigation (already wired in):** `fix-daemon.ps1` Step 0 detects a missing supervisor and `Start-ScheduledTask`s this task to rebuild it — so the manual/desktop recovery and the Heal task both self-heal this case. Pick the limit to match how long the box realistically stays up between reboots; 365 days is safe for a PC that reboots monthly, but if you shorten it, make sure the self-heal (Step 11) is installed. See [`../references/post-deploy-hardening.md`](../references/post-deploy-hardening.md) §17.
+
 ## Step 9 — 👤 Telegram pairing
 
 After the daemon's visible window shows `Listening for channel messages from: plugin:telegram@claude-plugins-official`:
@@ -691,9 +693,10 @@ if (Test-Path "$skillScripts\fix-daemon.ps1") {
     # — keep these in sync if you modify either.
     $fixContent = @'
 # fix-daemon.ps1 — idempotent self-heal for the Telegram daemon.
-# Kills any bun whose root parent isn't claude --channels (i.e. Desktop App's
-# bun, which contends for the bot.pid slot), then kills the daemon claude
-# itself so start-claude.ps1's while-loop respawns it with a fresh bun.
+# Step 0 rebuilds the supervisor if the daemon task was time-limit-killed;
+# then kills any bun whose root parent isn't claude --channels (Desktop App's
+# bun contending for bot.pid) and kills the daemon claude so start-claude.ps1's
+# while-loop respawns it with a fresh bun.
 # Safe to re-run; ~15-s downtime per run; no message loss (Telegram queues).
 
 $ErrorActionPreference = 'Continue'
@@ -703,6 +706,25 @@ function Log($msg) {
 }
 
 Log "=== fix-daemon start ==="
+
+# 0. Rebuild the supervisor if it was killed (e.g. task hit ExecutionTimeLimit;
+#    RestartCount does not cover a time-limit kill). Otherwise Steps 1-2 would
+#    just leave daemon-claude=0.
+$supervisor = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*start-claude.ps1*' }
+if (-not $supervisor) {
+    Log "supervisor NOT running — starting ClaudeCodeTelegramDaemon task to rebuild it"
+    try {
+        Start-ScheduledTask -TaskName 'ClaudeCodeTelegramDaemon' -ErrorAction Stop
+        for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 2
+            $supervisor = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -like '*start-claude.ps1*' }
+            if ($supervisor) { break }
+        }
+        Log $(if ($supervisor) { "  supervisor rebuilt" } else { "  WARN supervisor still down — check ClaudeCodeTelegramDaemon" })
+    } catch { Log "  failed to start task: $($_.Exception.Message)" }
+} else { Log "supervisor alive" }
 
 $contendingBuns = @()
 Get-CimInstance Win32_Process -Filter "Name='bun.exe'" -ErrorAction SilentlyContinue | ForEach-Object {

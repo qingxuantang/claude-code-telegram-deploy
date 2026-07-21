@@ -744,6 +744,42 @@ Run the launcher once inside a PTY by hand — `tmux new-session -d -s t ~/start
 
 ---
 
+## §17. Windows daemon task `ExecutionTimeLimit` silently kills the supervisor on long-uptime machines (Windows)
+
+### Symptom
+
+A Windows box that has **not rebooted in several days** loses Telegram. Unlike the boot-time bot.pid race (§4), this happens *mid-session*, with no reboot and no user action:
+
+- No `claude.exe --channels` and **no** `powershell.exe` running `start-claude.ps1` (the supervisor is gone).
+- `ClaudeCodeTelegramDaemon` task State=Ready (not Running); it exited.
+- `~/start-claude.log`'s last line is `launched PID=NNN; waiting for exit...` with **no matching `EXITED` line after it** — the supervisor was killed mid-`WaitForExit`, not through its own loop.
+- Re-running `fix-daemon.ps1` alone does **not** fix it: `fix-daemon.log` shows `after-state: daemon-claude=0, bun=0` — it kills the daemon but there's no supervisor to respawn it.
+
+### Cause
+
+The `ClaudeCodeTelegramDaemon` Scheduled Task is registered with a finite `ExecutionTimeLimit` (the skill uses `New-TimeSpan -Days 365`). `start-claude.ps1` is a `while ($true)` loop that never exits, so the task runs continuously. **When the machine's uptime exceeds `ExecutionTimeLimit`, Windows Task Scheduler terminates the task** — killing the supervisor.
+
+The kicker: `RestartCount = 999` does **not** rescue this. `RestartCount` only restarts the task when it exits with a *failure*; a **time-limit termination is a forced stop, not a failure**, so no restart fires. The `AtLogOn` trigger won't re-fire either (the user is already logged on). So the supervisor stays dead until the next logon/reboot, and the daemon is gone the whole time.
+
+Production incident 2026-07-21: a deployment whose daemon task carried a **72-hour** limit ran on a laptop that stayed up ~4 days. At the 72 h mark (≈day 3) the supervisor was force-terminated; the daemon died and never came back. Because the desktop recovery script only killed-and-expected-respawn, running it did nothing (`daemon-claude=0`). Recovery required manually `Start-ScheduledTask ClaudeCodeTelegramDaemon`.
+
+> The skill's own default (365 days) has the *same* latent behavior — just a much longer fuse, unlikely to bite a PC that reboots monthly. The 72 h value in the incident was a shorter limit on that particular machine's task. **The gotcha is structural to any finite limit + a never-exiting supervisor, not to a specific number.**
+
+### Fix
+
+Two parts, and we deliberately keep the limit **finite** (not `PT0S`/unlimited) — a runaway unattended supervisor should still be reapable — rather than removing the fuse:
+
+1. **Make the self-heal rebuild a dead supervisor.** `scripts/windows/fix-daemon.ps1` **Step 0** now checks for a running `start-claude.ps1`; if absent it `Start-ScheduledTask ClaudeCodeTelegramDaemon` and waits for the supervisor to come up, *before* the kill/reclaim steps. This makes both the desktop `Fix Claude Telegram Daemon.cmd` and the periodic `ClaudeCodeTelegramDaemonHeal` task self-heal the dead-supervisor case — not just the bot.pid race.
+
+2. **Set the limit to match realistic uptime.** 365 days is fine for a PC that reboots monthly. If you shorten it, ensure Step 11's self-heal is installed so a time-limit kill recovers on the next heal run. (To truly disable the fuse, set `ExecutionTimeLimit` to `PT0S` in-place: `$t = Get-ScheduledTask -TaskName ClaudeCodeTelegramDaemon; $t.Settings.ExecutionTimeLimit = 'PT0S'; Set-ScheduledTask -TaskName ClaudeCodeTelegramDaemon -Settings $t.Settings` — but the skill keeps it finite by choice.)
+
+### How to tell this apart from the bot.pid race (§4)
+
+- **§4 race**: supervisor is **alive**, daemon claude alive, but a *Desktop App* bun owns `bot.pid`. `fix-daemon` reclaims it in one run.
+- **§17 time-limit kill**: supervisor is **gone**, `fix-daemon.log` shows `daemon-claude=0` after a run, `start-claude.log` ends on a `waiting for exit...` with no `EXITED`. Needs the task restarted (now automatic via Step 0).
+
+---
+
 ## Verifying a healthy deployment
 
 After running the skill, the following sanity checks should all pass:
