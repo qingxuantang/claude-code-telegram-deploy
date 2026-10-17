@@ -246,9 +246,46 @@ Rewrite the file as pure ASCII (replace `—` with `--`, smart quotes with plain
 
 This is the **long-session drift** failure (see [`post-deploy-hardening.md`](./post-deploy-hardening.md) §7). Recovery:
 
-1. Restart the daemon — fresh session has clean attention to CLAUDE.md.
-2. Don't try to "wake it up" with another Telegram message; the drift is locked in until restart.
-3. Long-term: schedule a nightly restart via cron / `launchd` calendar interval / Task Scheduler trigger.
+1. Confirm it's drift, not a dead process: the daemon is alive and the transcript shows replies written to the terminal but the reply tool calls stopped (Step 6). If `tmux send-keys -t claude -l "ZZZ"` doesn't echo in the pane, the TUI has frozen outright — same cure, you just can't interact with it anymore.
+2. Restart the daemon — fresh session has clean attention to CLAUDE.md.
+3. To keep the in-flight task across the restart, append a short handoff to the daemon's `CLAUDE.md` first. The transcript JSONL under `~/.claude/projects/<cwd-slug>/` survives the restart; a frozen session can't summarize itself, so do the handoff from outside (see §7).
+4. Don't try to "wake it up" with another Telegram message; the drift is locked in until restart.
+5. Long-term: schedule a nightly restart via cron / `launchd` calendar interval / Task Scheduler trigger.
+
+---
+
+## Symptom: daemon is up but replies fail with `API Error: 529 Overloaded`
+
+Everything is healthy — daemon alive, bot owns `getUpdates`, auth valid (no 401) — but the message gets processed and the model call returns `API Error: 529 Overloaded`. The turn ends in failure and claude goes back to idle (low CPU), so it *looks* stuck but isn't.
+
+**What it is**: `529` is Anthropic server-side capacity pressure for a specific model, usually transient. It is distinct from a revoked token (`401`), a frozen/drifted session, and an OOM/crash. The retry is **not** automatic — the message that hit 529 is dropped and must be resent.
+
+**Diagnose**: read the tmux pane / session transcript — a `529 Overloaded` line (or a transcript entry with a `<synthetic>` model placeholder) is the tell. The daemon itself is fine (service active, bun alive, `bot.pid` correct, no 401).
+
+**Mitigation**:
+
+1. Resend the message; 529 is often transient.
+2. If it recurs, pin the daemon to a less-contended model — the newest/hottest model takes the brunt of 529. Add `--model <older-model>` to `start-claude.{sh,ps1}` (e.g. the previous-generation Opus) and restart. See [`post-deploy-hardening.md`](./post-deploy-hardening.md) §8 for the model-pin mechanism.
+3. If a cooler model still 529s, it's fleet-wide overload — wait and check the Anthropic status page.
+
+---
+
+## Symptom (Linux): daemon crash-loops with `ENOSPC: no space left on device`
+
+The supervisor log / tmux pane shows claude starting and immediately dying with `Error: ENOSPC: no space left on device, write` (from an `appendFileSync` deep in `cli.js`), then "restarting in 3s", on repeat. No claude/bun child survives and `bot.pid` is empty. Root cause: the disk is full, so claude can't write its session transcript and crashes on startup.
+
+**Diagnose**:
+
+```bash
+df -h /                              # is the root filesystem at 100%?
+du -x -h -d1 ~ | sort -rh | head     # what's eating it?
+```
+
+**Fix**: free space, then the while-loop's next restart brings the daemon up cleanly (a fresh session — the crash loop had none to preserve).
+
+> ⚠️ **Gotcha**: at 0 bytes free, `npm cache clean --force` **cannot run** — it needs to write its own temp/log files and fails with the same ENOSPC. Delete the cache store directly instead: `rm -rf ~/.npm/_cacache` (safe — npm rebuilds it on demand). The `~/.npm` cache is usually the single biggest reclaimable chunk.
+
+Common space hogs on a long-lived daemon host: `~/.npm` (cache), `~/.cache` (e.g. Playwright browsers), `/var/log`, and accumulated session transcripts under `~/.claude/projects/`.
 
 ---
 

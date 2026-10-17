@@ -176,6 +176,20 @@ But the **primary defense remains the CLAUDE.md rule** + post-compact mitigation
 
 **Long-term fix** (not implemented): a watchdog that monitors the bot's `getUpdates` for high-latency / dropped acks and force-restarts. The Mac skill's self-heal logic could be extended to detect this case.
 
+**Escalation — drift can harden into a full TUI freeze**: in a later incident the drifted session stopped reading keyboard input entirely (the TUI froze; the process stayed alive, sleeping, ~0% CPU). Two-step diagnosis:
+
+- **Drift vs. working**: grep the session transcript for the reply tool name (see [`troubleshooting.md`](./troubleshooting.md) Step 6). If replies landed only in the terminal and the tool calls stopped, it's drift.
+- **Frozen vs. merely drifted**: send a literal character into the pane — `tmux send-keys -t claude -l "ZZZ"` — then capture it. If `ZZZ` does **not** appear, the TUI is frozen (not reading stdin) and only a restart recovers it. (On Windows, the equivalent is that the minimized claude console stops echoing.)
+
+**Recovery that preserves context (a frozen session can't summarize itself)**: a restart loses the live session, but the transcript persists on disk and the restart does not touch it. Do the handoff from **outside** the frozen session (e.g. over SSH from another machine):
+
+1. The transcript JSONL lives at `~/.claude/projects/<cwd-slug>/*.jsonl` (Windows: `%USERPROFILE%\.claude\projects\...`); a restart never deletes it.
+2. Read its recent tail — a small script that condenses assistant text + `tool_use` file paths/commands is enough — to reconstruct the in-flight task.
+3. Append a short handoff section to the daemon's **`CLAUDE.md`** (the one file a fresh session is guaranteed to auto-load) describing the task, the current blocker, and the next steps.
+4. Restart the daemon, then verify the fresh session is up and responsive.
+
+Result: two backups — the handoff in `CLAUDE.md` (auto-loaded) and the raw JSONL on disk (full history).
+
 ---
 
 ## §8. Slash commands over Telegram don't work (universal architectural limit)
