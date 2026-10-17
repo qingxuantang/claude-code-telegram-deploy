@@ -39,7 +39,7 @@ Optional (only if Step 2's auth check fails):
 | `$env:CLAUDE_CODE_OAUTH_TOKEN` | `sk-ant-oat01-...` | From `claude setup-token` in a separate cmd window |
 
 Auto-detected:
-| `$env:CLAUDE_EXE` | absolute path | Latest under `%APPDATA%\Claude\claude-code\<version>\claude.exe` |
+| `$env:CLAUDE_EXE` | absolute path | Newest `claude.exe` under `%APPDATA%\Claude\claude-code\` (as of 2026-10 nested as `<version>\<hash>\claude.exe`; resolved recursively) |
 | `$env:BUN_EXE` | absolute path | `%USERPROFILE%\.bun\bin\bun.exe` |
 
 ## Network check (pre-flight)

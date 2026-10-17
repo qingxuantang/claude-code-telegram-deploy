@@ -46,7 +46,7 @@ Platform overlays:
 
 **Fix**: A hard rule in CLAUDE.md (Rule 2 in [`claude-md-rules.md`](./claude-md-rules.md)) forbidding the model from invoking any select / numbered-picker widget, regardless of mode. The rule applies even in pure terminal mode because a channel can be attached later, and any lingering picker locks it out.
 
-Recovery for an already-stuck session: kill the daemon (`pkill claude` / `Stop-ScheduledTask`) and restart. The session's context is lost.
+Recovery for an already-stuck session: if the TUI still responds, the least-destructive option is to answer or dismiss the widget directly in the pane — `tmux send-keys -t claude Enter` to pick the highlighted choice, or `Escape` to cancel — which unblocks the session **without losing context**. (Answering executes whatever the chosen option does, so for an irreversible action, dismiss rather than blindly confirm.) If the pane no longer echoes keystrokes — `tmux send-keys -t claude -l "ZZZ"` doesn't appear, i.e. the TUI has frozen outright (see §7) — fall back to killing the daemon (`pkill claude` / `Stop-ScheduledTask`) and restarting, which loses the session's context.
 
 ---
 
@@ -73,7 +73,7 @@ Error: claude native binary not installed
 **Platform applicability**:
 - **macOS** ([`platforms/macos.md`](../platforms/macos.md) Step 7.1): self-heal integrated into `start-claude.sh`. The macOS deploy was the original site of this incident.
 - **Linux**: same risk in principle; Linux skill could be enhanced with the same logic. As of writing, not observed in production on Linux servers.
-- **Windows**: the daemon reuses the **bundled `claude.exe` from the Desktop App's directory**, which Anthropic manages via its own auto-updater (not npm). The npm optional-dep failure mode doesn't apply. If the Desktop App's bundled binary breaks, the user would need to reinstall the Desktop App — out of scope for this skill.
+- **Windows**: the daemon reuses the **bundled `claude.exe` from the Desktop App's directory**, which Anthropic manages via its own auto-updater (not npm). The npm optional-dep failure mode doesn't apply. The more common Windows failure is the binary **moving** rather than breaking: Desktop App updates relocate `claude.exe` (a new version dir, and as of 2026-10 a per-build hash subdir — `claude-code\<version>\<hash>\claude.exe`), which breaks any hardcoded or shallow-joined path and crash-loops the supervisor. The launcher handles this by resolving `claude.exe` **recursively** at run time (see [`../platforms/windows.md`](../platforms/windows.md) Step 6). Only if the bundled binary is genuinely missing/corrupt would the user reinstall the Desktop App.
 
 ---
 
