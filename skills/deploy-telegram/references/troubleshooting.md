@@ -289,6 +289,20 @@ Common space hogs on a long-lived daemon host: `~/.npm` (cache), `~/.cache` (e.g
 
 ---
 
+## Symptom: a message gets no reply AND the bot never shows a "typing…" indicator
+
+Distinct from the "no reply" causes above: here *other* (plain) messages from the same sender work, but a particular message gets **no reply and no "typing…" indicator**. The message is dropped **before** Claude ever sees it — the daemon logs no inbound event for it.
+
+**Confirmed trigger: rich-text / formatted inbound messages.** Telegram Premium users can send formatted text (bold, code, blockquote / "quote" blocks, etc.) and the client no longer offers to "remove formatting" first, so the message is sent carrying formatting *entities*. In a reproduced case, such a message was fetched by the plugin's poller (it left Telegram's queue — a `getUpdates` probe afterwards showed `0` pending) yet produced **no `notifications/claude/channel` event, no `sendChatAction('typing')`, and no error**. Stripping the formatting and resending the identical text delivered instantly. Plain-text messages are unaffected.
+
+> The exact mechanism is unconfirmed and worth reporting upstream: the plugin's `gate()` delivers for allowlisted private chats regardless of content, and the 4096-char limit only governs *outbound* reply chunking — so neither explains the drop. It appears to be in the plugin's handling of certain message entities.
+
+**Confirm it**: run the daemon with `--debug-file <path>` (plain `--debug` writes to the TUI, which a `script`/tmux wrapper discards to `/dev/null`), then have the sender send a plain message and a formatted one. The plain one logs `notifications/claude/channel: …`; the formatted one logs nothing. Briefly stopping the daemon and calling `getUpdates` yourself — `0` pending — confirms the poller fetched-and-acked it rather than it being stuck in Telegram's queue.
+
+**Workaround**: send **plain text** — strip formatting before sending. Telegram Premium users must remove it explicitly, since the client won't prompt.
+
+---
+
 ## Symptom (macOS): Bash / Read tool returns `Operation not permitted` (errno=1, EPERM) on `~/Downloads`/`~/Documents`/`~/Desktop`
 
 This is the **hardened-`claude.exe` TCC reset** issue, macOS-specific. See [`post-deploy-hardening.md`](./post-deploy-hardening.md) §11 for the full root-cause explanation.
